@@ -2,17 +2,12 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) without python-telegram-bot.
 
-This is your original script with:
+This version V3 features:
+1. Non-blocking BackgroundScheduler for fast, consistent word delivery.
+2. Refined user lock management for improved queue handling and concurrency.
+3. Better responsiveness to commands by ensuring locks are held only for the duration of an active task.
 
-a single Flask app instance (no duplicates),
-a robust /health (GET, HEAD) endpoint and /health/ alternate,
-a /debug/routes endpoint to list registered routes,
-root (/) accepts GET for health and forwards POST to webhook() as a fallback,
-logging to stdout for Render,
-
-***NON-BLOCKING OPTIMIZATION INTEGRATED***
-The word-splitting now uses the BackgroundScheduler to manage the delay, 
-preventing a single user's task from blocking the entire bot process.
+Run with: gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
 import time
@@ -71,7 +66,6 @@ def init_db():
             """
         )
         # tasks: one row per submitted text task
-        # Added 'current_index' for pause/resume functionality
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -116,6 +110,8 @@ def init_db():
         conn.commit()
 
 def db_execute(query, params=(), fetch=False):
+    # NOTE: The global lock is necessary for SQLite access in a multi-threaded environment.
+    # Slowness here means other threads are waiting.
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(query, params)
@@ -172,6 +168,7 @@ def is_maintenance_now() -> bool:
     return h >= MAINTENANCE_START_HOUR_WAT or h < MAINTENANCE_END_HOUR_WAT
 
 # --- Telegram API helpers (requests) ---
+# (tg_call, send_message, delete_message, set_webhook functions remain unchanged)
 
 def tg_call(method: str, payload: dict):
     if not TELEGRAM_API:
@@ -220,6 +217,10 @@ def set_webhook():
         return None
 
 # --- Task management ---
+# (enqueue_task, get_next_task_for_user, get_running_task_for_user, set_task_status, 
+# mark_task_paused, mark_task_resumed, mark_task_done, cancel_active_task_for_user, 
+# record_split_log, record_sent_message, mark_message_deleted, get_messages_older_than 
+# functions remain unchanged)
 
 def enqueue_task(user_id: int, username: str, text: str) -> dict:
     words = split_text_into_words(text)
@@ -314,6 +315,7 @@ def get_messages_older_than(days=1):
     return res
 
 # --- Authorization helpers ---
+# (is_allowed, is_admin functions remain unchanged)
 
 def is_allowed(user_id: int) -> bool:
     rows = db_execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,), fetch=True)
@@ -327,17 +329,24 @@ def is_admin(user_id: int) -> bool:
 
 # --- Background Scheduler Logic (The Non-Blocking Core) ---
 
+def release_user_lock_if_held(user_id: int):
+    """Helper to safely release the lock if it's currently held."""
+    lock = get_user_lock(user_id)
+    if lock.locked():
+        try:
+            lock.release()
+            # Try to immediately start the next task for this user
+            threading.Thread(target=process_user_queue, args=(user_id, user_id, ""), daemon=True).start()
+        except RuntimeError:
+            pass # Lock wasn't held by this thread
+
 def send_word_and_schedule_next(task_id: int, user_id: int, chat_id: int, words: List[str], index: int, interval: float, username: str):
     """Sends a single word and schedules the next word to be sent if the task is running."""
     
     lock = get_user_lock(user_id)
-    # The lock must be held for the duration of this function to ensure atomicity 
-    # (e.g., status check + message send + index update)
     if not lock.acquire(blocking=False):
-        logger.warning(f"Scheduler tried to run job for user {user_id}, but lock was held. Skipping.")
-        # This can happen if the global worker tries to process the next task, 
-        # or if two scheduled jobs collide. We'll rely on the main process_user_queue 
-        # to re-acquire the lock if needed.
+        # This shouldn't happen for a scheduled job unless the lock was explicitly released
+        # and re-acquired by the global worker. Skip this cycle.
         return
     
     try:
@@ -350,31 +359,28 @@ def send_word_and_schedule_next(task_id: int, user_id: int, chat_id: int, words:
         status = status_row[0][0]
         
         if status == "cancelled":
-            # Task was cancelled by user
             set_task_status(task_id, "cancelled")
             send_message(chat_id, "🛑 Active Task Stopped! The current word transmission has been terminated.")
             return
-
+        
         if status == "paused":
             # Task is paused, store the index and terminate this chain
             mark_task_paused(task_id, index)
             send_message(chat_id, "⏸️ Task Paused! Waiting for /resume to continue.")
             return
 
-        # Status must be 'running' to proceed
         if status != "running":
-            logger.warning(f"Task {task_id} status is unexpected: {status}. Stopping scheduler chain.")
+            # Unexpected status, treat as done/error
             return
         
         # 2. Send the current word
         if index < len(words):
             send_message(chat_id, words[index])
             
-            # Update the current index in DB (only if running)
+            # Update the current index in DB
             db_execute("UPDATE tasks SET current_index = ? WHERE id = ?", (index + 1, task_id))
         else:
-            # Should not happen if logic is correct, but handles edge case
-            logger.warning(f"Task {task_id} index out of bounds: {index}/{len(words)}")
+            # Should not happen
             return
 
         # 3. Determine next action
@@ -410,13 +416,18 @@ def send_word_and_schedule_next(task_id: int, user_id: int, chat_id: int, words:
             
     except Exception:
         logger.exception(f"Fatal error in scheduled word transmission for task {task_id}")
-        # Mark as cancelled on failure
         set_task_status(task_id, "cancelled")
         send_message(chat_id, "❌ Critical Error: Word transmission failed unexpectedly and has been stopped.")
     finally:
-        # Lock is released when a scheduled job finishes execution
-        if lock.locked():
-            lock.release()
+        # Crucial: Release the lock *only* if the task is complete/cancelled/paused
+        status = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
+        if status and status[0][0] in ('done', 'cancelled', 'paused'):
+            if lock.locked():
+                 lock.release()
+                 # Immediately trigger a check for the next task
+                 if status[0][0] != 'paused':
+                    threading.Thread(target=process_user_queue, args=(user_id, user_id, ""), daemon=True).start()
+
 
 # --- Background worker to process tasks for users ---
 
@@ -425,16 +436,19 @@ _worker_stop = threading.Event()
 def process_user_queue(user_id: int, chat_id: int, username: str):
     lock = get_user_lock(user_id)
     
-    # 1. Acquire lock for this user to ensure only one task runs/schedules at a time
+    # Check if lock is already held. If so, another process is running, exit.
+    if lock.locked():
+        return
+    
+    # 1. Acquire lock for this user
     if not lock.acquire(blocking=False):
-        # Another worker is already processing or scheduling for this user, terminate this thread
         return
     
     try:
         # 2. Get the next queued task
         task = get_next_task_for_user(user_id)
         if not task:
-            # No more tasks for this user
+            # No queued task, release lock and exit
             return 
 
         task_id = task["id"]
@@ -454,12 +468,11 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
         )
         send_message(chat_id, start_msg)
         
-        # 3. Schedule the very first word immediately, which then schedules the rest
-        # Start index is always 0 for a new queued task
+        # 3. Schedule the very first word immediately
         scheduler.add_job(
             send_word_and_schedule_next, 
             "date", 
-            run_date=datetime.utcnow() + timedelta(seconds=0.1), # Small delay to allow start_msg to be sent first
+            run_date=datetime.utcnow() + timedelta(seconds=0.1), 
             kwargs={
                 "task_id": task_id, 
                 "user_id": user_id, 
@@ -473,37 +486,34 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             replace_existing=True
         )
         
-        # The worker thread's job is done here. The lock is held until the 
-        # scheduled chain is complete or terminated.
-        
     except Exception:
         logger.exception("Error in process_user_queue")
+        # If an error occurred before starting the job, release the lock immediately.
+        if lock.locked():
+             lock.release()
     finally:
-        # DO NOT release the lock here. It must be released inside 
-        # send_word_and_schedule_next when the task is done/cancelled/paused.
-        # If an error occurred *before* scheduling, release it manually.
-        pass # Lock management moved to scheduler for non-blocking process
+        # The lock MUST NOT be released here. It's released by the scheduler chain.
+        pass
 
 def global_worker_loop():
     while not _worker_stop.is_set():
         try:
-            # Check for queued tasks OR paused tasks that need to be resumed 
-            # (though resume is typically command-triggered)
-            rows = db_execute("SELECT DISTINCT user_id, username FROM tasks WHERE status IN ('queued', 'running', 'paused') ORDER BY created_at ASC", fetch=True)
+            # Look for any user with a queued task
+            rows = db_execute("SELECT DISTINCT user_id, username FROM tasks WHERE status IN ('queued') ORDER BY created_at ASC", fetch=True)
             for r in rows:
                 user_id = r[0]
                 username = r[1] or ""
-                # Only try to process if the lock is not currently held, meaning 
-                # a previous task has finished or is about to start.
+                # Use a separate thread to attempt processing for concurrency
                 if not get_user_lock(user_id).locked():
-                    t = threading.Thread(target=process_user_queue, args=(user_id, user_id, username), daemon=True)
-                    t.start()
-            time.sleep(2)
+                     t = threading.Thread(target=process_user_queue, args=(user_id, user_id, username), daemon=True)
+                     t.start()
+            time.sleep(2) # Reduced frequency to reduce DB contention slightly
         except Exception:
             traceback.print_exc()
             time.sleep(5)
 
 # --- Scheduler jobs ---
+# (scheduler setup remains unchanged)
 
 scheduler = BackgroundScheduler()
 
@@ -546,6 +556,7 @@ _worker_thread = threading.Thread(target=global_worker_loop, daemon=True)
 _worker_thread.start()
 
 # --- Flask webhook endpoint (POST only) ---
+# (webhook and root_forward remain unchanged)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -576,14 +587,12 @@ def webhook():
 # --- Command handlers ---
 
 def handle_command(user_id: int, username: str, command: str, args: str):
-    # ... (No change to authorization logic)
     if not is_allowed(user_id) and command not in ("/start", "/help"):
         send_message(user_id, f"❌ Sorry! You are not allowed to use this bot. A request has been sent to the owner.")
         send_message(OWNER_ID, f"⚠️ Unallowed access attempt by @{username or user_id} ({user_id}). Message: {args or '[no text]'}")
         return jsonify({"ok": True})
         
     if command == "/start":
-        # ... (No change)
         body = (
             f"👋 Welcome, @{username or user_id}!\n"
             "I split your text into individual word messages. Commands:\n"
@@ -595,7 +604,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if command == "/example": 
-        # ... (No change)
         sample = "This is a demo split" 
         send_message(user_id, "Running example split...") 
         enqueue_task(user_id, username, sample) 
@@ -609,11 +617,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             return jsonify({"ok": True}) 
         
         task_id = active_task["id"]
-        # Pausing is now handled by the scheduler's check in send_word_and_schedule_next
-        # We just need to mark the status as paused in the DB.
-        # The scheduler will see 'paused' and call mark_task_paused with the current index.
+        # Set status to paused. The next scheduled job will handle the message and index update.
         set_task_status(task_id, "paused") 
-        # The message will be sent by the scheduler itself when it hits the pause status.
+        # Acknowledge immediately for better responsiveness
+        send_message(user_id, "⏸️ **Task Paused!** Waiting for /resume to continue.")
         return jsonify({"ok": True}) 
         
     if command == "/resume": 
@@ -628,8 +635,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         current_index = paused_task["current_index"]
         interval = compute_interval(total) 
 
-        mark_task_resumed(task_id) # Set status to running
-        send_message(user_id, "▶️ **Welcome Back!** Resuming word transmission now.") 
+        mark_task_resumed(task_id) 
         
         # Restart the scheduling chain from the current index
         scheduler.add_job(
@@ -649,15 +655,15 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             replace_existing=True
         )
 
+        send_message(user_id, "▶️ **Welcome Back!** Resuming word transmission now.") 
         return jsonify({"ok": True}) 
         
     if command == "/status": 
-        # ... (Slight change to use new get_running_task_for_user)
         active = get_running_task_for_user(user_id)
         queued = get_queue_size(user_id)
 
         if active: 
-            aid, status, total_words, created_at, current_index = active["id"], active["status"], active["total_words"], active["text"], active["current_index"]
+            status, total_words, current_index = active["status"], active["total_words"], active["current_index"]
             send_message(user_id, f"📊 **Current Status Check**\nStatus: {status}\nRemaining words: {total_words - current_index}\nQueue size: {queued}") 
         else: 
             if queued > 0: 
@@ -667,26 +673,18 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/stop": 
-        # ... (No change to core logic, but cleanup for scheduler if needed)
         stopped = cancel_active_task_for_user(user_id)
         
-        # Manually release the lock if an active task was running, as cancellation 
-        # will prevent the scheduler from releasing it.
+        # Crucial: Immediately release the lock for queue progression
+        release_user_lock_if_held(user_id)
+        
         if stopped > 0:
-            lock = get_user_lock(user_id)
-            if lock.locked():
-                try:
-                    lock.release()
-                except RuntimeError:
-                    pass # Lock wasn't held by this thread
-            
             send_message(user_id, f"🛑 **Active Task Stopped!** The current word transmission has been terminated. All your queued tasks have also been cleared.")
         else:
             send_message(user_id, "ℹ️ You had no active or queued tasks.") 
         return jsonify({"ok": True}) 
 
     if command == "/stats": 
-        # ... (No change)
         cutoff = datetime.utcnow() - timedelta(hours=12) 
         rows = db_execute("SELECT SUM(words) FROM split_logs WHERE created_at >= ?", (cutoff.isoformat(),), fetch=True) 
         words = int(rows[0][0] or 0) 
@@ -694,7 +692,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/about": 
-        # ... (No change)
         body = ( 
             "*About This Bot*\n" 
             "I split texts into individual word messages. Speed control is dynamic based on total words.\n" 
@@ -705,7 +702,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/adduser": 
-        # ... (No change)
         if not is_admin(user_id): send_message(user_id, "❌ You are not allowed to use this command.") ; return jsonify({"ok": True}) 
         if not args: send_message(user_id, "Usage: /adduser <telegram_user_id> [username]") ; return jsonify({"ok": True}) 
         parts = args.split() 
@@ -720,7 +716,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/removeuser": 
-        # ... (No change)
         if not is_admin(user_id): send_message(user_id, "❌ You are not allowed to use this command.") ; return jsonify({"ok": True}) 
         if not args: send_message(user_id, "Usage: /removeuser <telegram_user_id>") ; return jsonify({"ok": True}) 
         try: target_id = int(args.split()[0]) 
@@ -731,7 +726,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/listusers": 
-        # ... (No change)
         if not is_admin(user_id): send_message(user_id, "❌ You are not allowed to use this command.") ; return jsonify({"ok": True}) 
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True) 
         lines = [] 
@@ -741,7 +735,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/botinfo": 
-        # ... (No change)
         if user_id != OWNER_ID: send_message(user_id, "❌ Only the bot owner can use /botinfo") ; return jsonify({"ok": True}) 
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0] 
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0] 
@@ -760,7 +753,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True}) 
         
     if command == "/broadcast": 
-        # ... (No change)
         if user_id != OWNER_ID: send_message(user_id, "❌ Only owner can broadcast") ; return jsonify({"ok": True}) 
         if not args: send_message(user_id, "Usage: /broadcast <message>") ; return jsonify({"ok": True}) 
         rows = db_execute("SELECT user_id FROM allowed_users", fetch=True) 
@@ -783,7 +775,6 @@ def get_queue_size(user_id):
     return q[0][0] if q else 0
 
 def handle_new_text(user_id: int, username: str, text: str):
-    # ... (No change)
     if not is_allowed(user_id):
         send_message(user_id, "❌ Sorry! You are not allowed to use this bot. A request has been sent to the owner.")
         send_message(OWNER_ID, f"⚠️ Unallowed access attempt by @{username or user_id} ({user_id}). Message: {text}")
@@ -804,6 +795,8 @@ def handle_new_text(user_id: int, username: str, text: str):
     if qsize > 1:
         send_message(user_id, f"📝 Queued! You currently have {qsize} task(s) waiting in line. Your current task must finish first.")
     else:
+        # Immediately try to start the task if the queue size is 1 (meaning this is the next one)
+        threading.Thread(target=process_user_queue, args=(user_id, user_id, username), daemon=True).start()
         send_message(user_id, f"🚀 Task queued and will start shortly. Words: {res['total_words']}. Time per word: {compute_interval(res['total_words'])}s")
     return jsonify({"ok": True})
 
@@ -836,7 +829,6 @@ def debug_routes():
         return jsonify({"ok": False, "error": "failed to list routes"}), 500
 
 if __name__ == "__main__":
-    # Optionally set webhook when running directly (local debug). On Render, gunicorn will import app and this block won't run.
     try:
         set_webhook()
     except Exception:
