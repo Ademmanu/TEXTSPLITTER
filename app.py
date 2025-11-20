@@ -2,21 +2,14 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) without python-telegram-bot.
 
-Optimizations made:
-- Single Flask app instance (unchanged)
-- Webhook handling is now asynchronous: webhook returns quickly while processing happens in background threads -> fast replies to Telegram
-- Reused requests.Session for faster HTTP to Telegram
-- DB migration to add sent_count to tasks and track progress so /status shows accurate remaining words
-- enqueue and queue-size logic changed so the first task (when nothing is running) is not treated as "in queue"
-- Removed estimated times and removed time stamps from user-facing commands/reports
-- /stats now shows only the requesting user's stats for the last 12 hours
-- /botinfo now reports user stats for the last 1 hour and sorts users by words splitted (desc)
-- hourly owner report sorts users by words splitted (desc)
-- /listusers no longer shows '@' before usernames
-- Faster global worker loop polling interval
-- Friendly and simple text replies
-- Background scheduler jobs/health notifications simplified (no time strings)
-- Sent count incremented as words are sent for correct status tracking
+This file is the app implementation with the requested adjustments:
+- Removed the "🚀 Task queued and will start shortly." message before the first task starts.
+- Added /addadmin and /removeadmin commands (owner-only).
+- /adduser, /removeuser and /listusers are admin-accessible (admins or owner).
+- /botinfo, /broadcast, /addadmin and /removeadmin remain owner-only.
+- Updated welcome (/start) message to clearly show which commands are admin-only and owner-only.
+- Starting task notifications now include an estimated total time (no per-word speed shown).
+- Kept previous performance optimizations (async handling, session reuse, sent_count tracking).
 Run with: gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
@@ -29,7 +22,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, jsonify
 import requests
 
 # Configure logging to stdout
@@ -130,7 +123,6 @@ def init_db():
                 conn.commit()
                 logger.info("Migrated tasks table: added sent_count")
             except Exception:
-                # If alter fails for some reason, log and continue
                 logger.exception("Failed to add sent_count column (maybe already present)")
 
 
@@ -364,16 +356,18 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             set_task_status(task_id, "running")
             # queued count after picking this task (how many additional tasks are waiting)
             qcount = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+            # Get sent_count if any (resumed)
+            sent_info = db_execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,), fetch=True)
+            sent = int(sent_info[0][0] or 0) if sent_info else 0
+            remaining = max(0, total - sent)
             interval = compute_interval(total)
-            # Friendly start message, no estimated time
-            start_msg = f"🚀 Starting your split now. Words: {total}."
+            est_seconds = interval * remaining
+            est_str = str(timedelta(seconds=int(est_seconds)))
+            # Friendly start message with estimated total time, no per-word speed
+            start_msg = f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}."
             if qcount:
                 start_msg += f" There are {qcount} more task(s) waiting."
             send_message(chat_id, start_msg)
-            i = 0
-            # Ensure we capture any sent_count from DB if something resumed mid-way
-            sent_info = db_execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,), fetch=True)
-            sent = int(sent_info[0][0] or 0) if sent_info else 0
             i = sent
             while i < total:
                 status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
@@ -533,8 +527,9 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         body = (
             f"👋 Hi {username or user_id}!\n"
             "I split your text into individual word messages.\n"
-            "Commands: /start /example /pause /resume /status /stop /stats /about\n"
-            "Owner-only: /adduser /removeuser /listusers /botinfo /broadcast\n"
+            "Admin commands (admins + owner): /adduser /removeuser /listusers\n"
+            "Owner-only: /botinfo /broadcast /addadmin /removeadmin\n"
+            "User commands: /start /example /pause /resume /status /stop /stats /about\n"
             "Just send any text and I'll split it for you."
         )
         send_message(user_id, body)
@@ -549,7 +544,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if running_exists:
             send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
         else:
-            send_message(user_id, "🚀 Task queued and will start shortly.")
+            # Do not send the phrase that was requested to be removed.
+            send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
         return
 
     if command == "/pause":
@@ -614,6 +610,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, body)
         return
 
+    # Admin-manageable commands: accessible by admins (and owner because owner has is_admin=1)
     if command == "/adduser":
         if not is_admin(user_id):
             send_message(user_id, "❌ You are not allowed to use this.")
@@ -667,6 +664,48 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, body)
         return
 
+    # Owner-only admin toggles
+    if command == "/addadmin":
+        if user_id != OWNER_ID:
+            send_message(user_id, "❌ Only the owner can add admins.")
+            return
+        if not args:
+            send_message(user_id, "Usage: /addadmin <telegram_user_id>")
+            return
+        try:
+            target_id = int(args.split()[0])
+        except Exception:
+            send_message(user_id, "Invalid user id.")
+            return
+        # If user not present, insert them as admin
+        rows = db_execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (target_id,), fetch=True)
+        if not rows:
+            db_execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                       (target_id, "", datetime.utcnow().isoformat(), 1))
+        else:
+            db_execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (target_id,))
+        send_message(user_id, f"✅ {target_id} is now an admin.")
+        send_message(target_id, "✅ You have been granted admin privileges.")
+        return
+
+    if command == "/removeadmin":
+        if user_id != OWNER_ID:
+            send_message(user_id, "❌ Only the owner can remove admins.")
+            return
+        if not args:
+            send_message(user_id, "Usage: /removeadmin <telegram_user_id>")
+            return
+        try:
+            target_id = int(args.split()[0])
+        except Exception:
+            send_message(user_id, "Invalid user id.")
+            return
+        db_execute("UPDATE allowed_users SET is_admin = 0 WHERE user_id = ?", (target_id,))
+        send_message(user_id, f"✅ Admin removed: {target_id}")
+        send_message(target_id, "❌ Your admin privileges have been revoked.")
+        return
+
+    # Owner-only commands
     if command == "/botinfo":
         if user_id != OWNER_ID:
             send_message(user_id, "❌ Only the bot owner can use /botinfo")
@@ -739,7 +778,8 @@ def handle_new_text(user_id: int, username: str, text: str):
     if running_exists:
         send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
     else:
-        send_message(user_id, f"🚀 Task queued and will start shortly. Words: {res['total_words']}. Speed: {compute_interval(res['total_words'])}s per word")
+        # Removed "🚀 Task queued and will start shortly." as requested.
+        send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
     return
 
 
