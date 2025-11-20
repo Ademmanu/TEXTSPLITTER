@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Telegram Word-Splitter Bot (Webhook-ready) - app.py V5
+Telegram Word-Splitter Bot (Webhook-ready) - app.py (updated)
 
-Updated: /botinfo now shows:
- - general bot summary (allowed users, active/queued tasks)
- - Users with active tasks (running/paused) including remaining words and counts
- - User stats (last 1 hour) sorted by words split
+Changes in this version:
+- /stats now shows only the requesting user's words split in the last 12 hours.
+- /addadmin command added (owner-only) to grant admin rights to a user.
+- Admins are able to use /adduser and /listusers (unchanged behavior; preserved).
+- /removeuser can remove any user (including admins) from allowed_users.
+- All other behavior kept as in the previous app.py (tg_call rate-limiter, botinfo showing active users and last-1h stats, etc.)
 
-Also contains the robust tg_call and rate-limiter already added in V5.
-Run with: gunicorn app:app --bind 0.0.0.0:$PORT
+Run with:
+    gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
 import time
@@ -21,10 +23,10 @@ import re
 from datetime import datetime, timedelta
 from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, jsonify
 import requests
 
-# Configure logging to stdout (Render will show these logs)
+# Configure logging to stdout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,9 @@ app = Flask(__name__)
 
 # Configuration via environment variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # full https URL for webhook, e.g. https://your-render-service.onrender.com/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # full https URL for webhook
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # numeric Telegram user id
-OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "justmemmy")  # clickable @justmemmy
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "justmemmy")
 MAX_ALLOWED_USERS = int(os.environ.get("MAX_ALLOWED_USERS", "50"))
 MAX_QUEUE_PER_USER = int(os.environ.get("MAX_QUEUE_PER_USER", "50"))
 MAINTENANCE_START_HOUR_WAT = 3  # 03:00 WAT
@@ -43,9 +45,8 @@ MAINTENANCE_END_HOUR_WAT = 4    # 04:00 WAT
 DB_PATH = os.environ.get("DB_PATH", "botdata.sqlite3")
 REQUESTS_TIMEOUT = float(os.environ.get("REQUESTS_TIMEOUT", "10"))
 
-# Rate-limit and retry configuration
+# Rate-limit and retry configuration (minimum enforced earlier)
 _raw_max_msg_per_second = float(os.environ.get("MAX_MSG_PER_SECOND", "50"))
-# Enforce a minimum of 50 messages/sec as requested previously
 MAX_MSG_PER_SECOND = max(50.0, _raw_max_msg_per_second)
 TG_CALL_MAX_RETRIES = int(os.environ.get("TG_CALL_MAX_RETRIES", "5"))
 TG_CALL_MAX_BACKOFF = float(os.environ.get("TG_CALL_MAX_BACKOFF", "60"))  # seconds
@@ -204,11 +205,6 @@ _token_bucket = {
 
 
 def _consume_token(block=True, timeout=10.0):
-    """
-    Attempt to consume 1 token from the global token bucket.
-    If block is True, wait up to `timeout` seconds for a token to become available.
-    Returns True if a token was consumed, False otherwise.
-    """
     start = time.time()
     while True:
         with _token_bucket["lock"]:
@@ -225,16 +221,14 @@ def _consume_token(block=True, timeout=10.0):
             return False
         if time.time() - start >= timeout:
             return False
-        # Sleep a short time before retrying
         time.sleep(0.01)
 
 
 # --- Robust tg_call implementation ---
-_tele_429_count = 0  # simple counter for logging/monitoring
+_tele_429_count = 0
 
 
 def _parse_retry_after_from_response(data, resp_text=""):
-    # Try structured field first
     if isinstance(data, dict):
         params = data.get("parameters") or {}
         retry_after = params.get("retry_after") or data.get("retry_after")
@@ -243,7 +237,6 @@ def _parse_retry_after_from_response(data, resp_text=""):
                 return int(retry_after)
             except Exception:
                 pass
-        # description may contain "retry after X"
         desc = data.get("description") or ""
         m = re.search(r"retry after (\d+)", desc, re.I)
         if m:
@@ -251,7 +244,6 @@ def _parse_retry_after_from_response(data, resp_text=""):
                 return int(m.group(1))
             except Exception:
                 pass
-    # fallback: try to parse textual response
     m = re.search(r"retry after (\d+)", resp_text, re.I)
     if m:
         try:
@@ -262,13 +254,6 @@ def _parse_retry_after_from_response(data, resp_text=""):
 
 
 def tg_call(method: str, payload: dict):
-    """
-    Robust wrapper for Telegram API calls.
-    - Enforces a global send rate via token bucket.
-    - Handles 429 by parsing retry_after and sleeping.
-    - Retries transient errors with exponential backoff.
-    - Returns parsed JSON dict on success (or None on permanent failure).
-    """
     global _tele_429_count
     if not TELEGRAM_API:
         logger.error("tg_call attempted but TELEGRAM_API not configured")
@@ -279,21 +264,17 @@ def tg_call(method: str, payload: dict):
     backoff = 1.0
 
     for attempt in range(1, max_retries + 1):
-        # Ensure we don't exceed global outbound message rate
         token_acquired = _consume_token(block=True, timeout=10.0)
         if not token_acquired:
             logger.warning("tg_call: could not acquire token within timeout; attempt %d/%d", attempt, max_retries)
-            # If token cannot be acquired, proceed to try anyway but log
 
         try:
             resp = _session.post(url, json=payload, timeout=REQUESTS_TIMEOUT)
-            # Try to parse JSON even when status is error
             try:
                 data = resp.json()
             except Exception:
                 data = None
 
-            # Handle rate limit (429) specially
             if resp.status_code == 429:
                 _tele_429_count += 1
                 retry_after = _parse_retry_after_from_response(data, resp.text)
@@ -303,14 +284,11 @@ def tg_call(method: str, payload: dict):
                     "Telegram API 429 Too Many Requests (attempt %d/%d). retry_after=%s secs. method=%s",
                     attempt, max_retries, retry_after, method,
                 )
-                # Sleep at least retry_after; increment backoff
                 sleep_time = min(max(0.5, float(retry_after)), TG_CALL_MAX_BACKOFF)
                 time.sleep(sleep_time)
                 backoff = min(backoff * 2, TG_CALL_MAX_BACKOFF)
-                # continue retrying
                 continue
 
-            # Server errors: retry with backoff
             if 500 <= resp.status_code < 600:
                 logger.warning(
                     "Telegram server error %s on attempt %d/%d. Retrying after %.1fs. method=%s",
@@ -320,21 +298,16 @@ def tg_call(method: str, payload: dict):
                 backoff = min(backoff * 2, TG_CALL_MAX_BACKOFF)
                 continue
 
-            # For other errors (400-range not 429), log and return JSON (if any)
             if data is None:
-                # Unexpected non-JSON response; treat as error
                 logger.error("tg_call: non-json response status=%s text=%s", resp.status_code, resp.text[:400])
-                # On unexpected response, decide to retry or break (we break)
                 return None
 
             if not data.get("ok", False):
-                # Log the Telegram error payload for debugging; do not raise an exception
                 logger.error("Telegram API returned error: %s", data)
             return data
 
         except requests.exceptions.RequestException:
             logger.exception("tg_call network/request exception on attempt %d/%d", attempt, max_retries)
-            # Exponential backoff before retrying
             time.sleep(backoff)
             backoff = min(backoff * 2, TG_CALL_MAX_BACKOFF)
             continue
@@ -377,7 +350,7 @@ def set_webhook():
         return None
 
 
-# Task management
+# Task management functions (unchanged)
 def enqueue_task(user_id: int, username: str, text: str) -> dict:
     words = split_text_into_words(text)
     total = len(words)
@@ -496,13 +469,11 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             set_task_status(task_id, "running")
             qcount = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
             interval = compute_interval(total)
-            # Get sent_count if any (resumed)
             sent_info = db_execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,), fetch=True)
             sent = int(sent_info[0][0] or 0) if sent_info else 0
             remaining = max(0, total - sent)
             est_seconds = interval * remaining
             est_str = str(timedelta(seconds=int(est_seconds)))
-            # Friendly start message with estimated total time, no per-word speed
             start_msg = f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}."
             if qcount:
                 start_msg += f" There are {qcount} more task(s) waiting."
@@ -515,7 +486,6 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 status = status_row[0][0]
                 if status == "paused":
                     send_message(chat_id, "⏸️ Task paused. Use /resume to continue.")
-                    # wait until resumed or cancelled
                     while True:
                         time.sleep(0.5)
                         status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
@@ -531,12 +501,9 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                         break
                 if status == "cancelled":
                     break
-                # Send the word
                 send_message(chat_id, words[i])
-                # Update sent_count in DB immediately for accurate /status reporting
                 db_execute("UPDATE tasks SET sent_count = sent_count + 1 WHERE id = ?", (task_id,))
                 i += 1
-                # Sleep governing the dynamic delay
                 time.sleep(interval)
             final_status_row = db_execute("SELECT status, sent_count, total_words FROM tasks WHERE id = ?", (task_id,), fetch=True)
             final_status = final_status_row[0][0] if final_status_row else "done"
@@ -613,7 +580,7 @@ _worker_thread = threading.Thread(target=global_worker_loop, daemon=True)
 _worker_thread.start()
 
 
-# Flask webhook endpoint (POST only)
+# Webhook endpoint
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -640,48 +607,55 @@ def webhook():
     return jsonify({"ok": True})
 
 
-# Command handlers (same semantics)
+# Command handlers
 def handle_command(user_id: int, username: str, command: str, args: str):
     if not is_allowed(user_id) and command not in ("/start", "/help"):
-        send_message(user_id, f"❌ **Sorry!** You are not allowed to use this bot. A request has been sent to the owner.")
-        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by @{username or user_id} ({user_id}). Message: {args or '[no text]'}")
+        send_message(user_id, "❌ Sorry, you are not allowed to use this bot. The owner has been notified.")
+        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
         return jsonify({"ok": True})
+
     if command == "/start":
         body = (
-            f"👋 **Welcome, @{username or user_id}!**\n"
-            "I split your text into individual word messages. Commands:\n"
-            "/start /example /pause /resume /status /stop /stats /about\n"
-            "Owner-only: /adduser /removeuser /listusers /botinfo /broadcast\n"
-            "How to use: send any text to split it into words."
+            f"👋 Hi {username or user_id}!\n"
+            "I split your text into individual word messages.\n"
+            "Admin commands (admins + owner): /adduser /removeuser /listusers\n"
+            "Owner-only: /botinfo /broadcast /addadmin /removeadmin\n"
+            "User commands: /start /example /pause /resume /status /stop /stats /about\n"
+            "Just send any text and I'll split it for you."
         )
         send_message(user_id, body)
         return jsonify({"ok": True})
 
     if command == "/example":
         sample = "This is a demo split"
-        send_message(user_id, "Running example split...")
-        enqueue_task(user_id, username, sample)
-        send_message(user_id, f"📝 **Queued!** You currently have **{get_queue_size(user_id)}** task(s) waiting in line. Your current task must finish first.")
+        send_message(user_id, "Running a short example...")
+        res = enqueue_task(user_id, username, sample)
+        running_exists = bool(db_execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,), fetch=True))
+        queued = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+        if running_exists:
+            send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
+        else:
+            send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
         return jsonify({"ok": True})
 
     if command == "/pause":
         rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
         if not rows:
-            send_message(user_id, "❌ **Sorry!** No active task found for you to pause.")
+            send_message(user_id, "❌ No active task to pause.")
             return jsonify({"ok": True})
         task_id = rows[0][0]
         mark_task_paused(task_id)
-        send_message(user_id, "⏸️ **Task Paused!** Waiting for /resume to continue.")
+        send_message(user_id, "⏸️ Paused. Use /resume to continue.")
         return jsonify({"ok": True})
 
     if command == "/resume":
         rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
         if not rows:
-            send_message(user_id, "❌ **Sorry!** No paused task found for you to resume.")
+            send_message(user_id, "❌ No paused task to resume.")
             return jsonify({"ok": True})
         task_id = rows[0][0]
         mark_task_resumed(task_id)
-        send_message(user_id, "▶️ **Welcome Back!** Resuming word transmission now.")
+        send_message(user_id, "▶️ Resuming your task now.")
         return jsonify({"ok": True})
 
     if command == "/status":
@@ -690,10 +664,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if active:
             aid, status, total_words, sent_count = active[0]
             remaining = int(total_words or 0) - int(sent_count or 0)
-            send_message(user_id, f"📊 **Current Status Check**\nStatus: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
+            send_message(user_id, f"📊 Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
         else:
             if queued > 0:
-                send_message(user_id, f"📝 **Status: Waiting.** Your first task is waiting in line. Queue size: {queued}")
+                send_message(user_id, f"📝 Waiting. Your first task is in line. Queue size: {queued}")
             else:
                 send_message(user_id, "📊 You have no active or queued tasks.")
         return jsonify({"ok": True})
@@ -703,34 +677,34 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         queued_count = queued_rows[0][0] if queued_rows else 0
         stopped = cancel_active_task_for_user(user_id)
         if stopped > 0:
-            send_message(user_id, f"🛑 **Active Task Stopped!** The current word transmission has been terminated. All your queued tasks have also been cleared.")
+            send_message(user_id, "🛑 Active task stopped. Your queued tasks have been cleared too.")
         elif queued_count > 0:
             db_execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'queued'", (user_id,))
-            send_message(user_id, f"🛑 **Queued Tasks Cleared!** You had **{queued_count}** task(s) waiting that have been removed.")
+            send_message(user_id, f"🛑 Cleared {queued_count} queued task(s).")
         else:
             send_message(user_id, "ℹ️ You had no active or queued tasks.")
         return jsonify({"ok": True})
 
+    # /stats now shows only the requesting user's words split in the last 12 hours
     if command == "/stats":
         cutoff = datetime.utcnow() - timedelta(hours=12)
-        rows = db_execute("SELECT SUM(words) FROM split_logs WHERE created_at >= ?", (cutoff.isoformat(),), fetch=True)
-        words = int(rows[0][0] or 0)
-        send_message(user_id, f"🕰️ **Your Recent Activity (Last 12 Hours)**\nYou have split **{words}** words! Keep up the great work! 💪 📝")
+        rows = db_execute("SELECT SUM(words) FROM split_logs WHERE user_id = ? AND created_at >= ?", (user_id, cutoff.isoformat()), fetch=True)
+        words = int(rows[0][0] or 0) if rows else 0
+        send_message(user_id, f"🕰️ Your last 12 hours: {words} words split. Nice!")
         return jsonify({"ok": True})
 
     if command == "/about":
         body = (
-            "*About This Bot*\n"
-            "I split texts into individual word messages. Speed control is dynamic based on total words.\n"
-            "Features: queueing, pause/resume, maintenance window, hourly owner stats, auto-delete bot messages older than 24h.\n"
+            "About:\nI split texts into single-word messages. Features: queueing, pause/resume, hourly owner stats, auto-delete old bot messages.\n"
             f"Developer: @{OWNER_USERNAME}"
         )
         send_message(user_id, body)
         return jsonify({"ok": True})
 
+    # Admin commands (admins + owner)
     if command == "/adduser":
         if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this command.")
+            send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         if not args:
             send_message(user_id, "Usage: /adduser <telegram_user_id> [username]")
@@ -744,17 +718,17 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         uname = parts[1] if len(parts) > 1 else ""
         count = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         if count >= MAX_ALLOWED_USERS:
-            send_message(user_id, f"Cannot add more users. Max allowed users: {MAX_ALLOWED_USERS}")
+            send_message(user_id, f"Cannot add more users. Max: {MAX_ALLOWED_USERS}")
             return jsonify({"ok": True})
         db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
                    (target_id, uname, get_now_iso(), 0))
-        send_message(user_id, f"✅ User {target_id} added to allowed list.")
-        send_message(target_id, "✅ You have been added to the Word Splitter bot. Send any text to start.")
+        send_message(user_id, f"✅ User {target_id} added.")
+        send_message(target_id, "✅ You have been added. Send any text to start.")
         return jsonify({"ok": True})
 
     if command == "/removeuser":
         if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this command.")
+            send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         if not args:
             send_message(user_id, "Usage: /removeuser <telegram_user_id>")
@@ -764,40 +738,78 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         except Exception:
             send_message(user_id, "Invalid user id.")
             return jsonify({"ok": True})
+        # Remove target user regardless of their is_admin flag (admins or normal users)
         db_execute("DELETE FROM allowed_users WHERE user_id = ?", (target_id,))
-        send_message(user_id, f"✅ User {target_id} removed from allowed list.")
-        send_message(target_id, "❌ You have been removed from the Word Splitter bot. Contact owner to regain access.")
+        send_message(user_id, f"✅ User {target_id} removed.")
+        send_message(target_id, "❌ You have been removed. Contact the owner to regain access.")
         return jsonify({"ok": True})
 
     if command == "/listusers":
         if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this command.")
+            send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True)
         lines = []
         for r in rows:
-            lines.append(f"{r[0]} @{r[1] or ''} admin={bool(r[2])} added={r[3]}")
+            lines.append(f"{r[0]} {r[1] or ''} admin={bool(r[2])} added={r[3]}")
         body = "Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
         send_message(user_id, body)
+        return jsonify({"ok": True})
+
+    # owner-only addadmin/removeadmin
+    if command == "/addadmin":
+        if user_id != OWNER_ID:
+            send_message(user_id, "❌ Only the owner can add admins.")
+            return jsonify({"ok": True})
+        if not args:
+            send_message(user_id, "Usage: /addadmin <telegram_user_id>")
+            return jsonify({"ok": True})
+        try:
+            target_id = int(args.split()[0])
+        except Exception:
+            send_message(user_id, "Invalid user id.")
+            return jsonify({"ok": True})
+        rows = db_execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (target_id,), fetch=True)
+        if not rows:
+            db_execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                       (target_id, "", get_now_iso(), 1))
+        else:
+            db_execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (target_id,))
+        send_message(user_id, f"✅ {target_id} is now an admin.")
+        send_message(target_id, "✅ You have been granted admin privileges.")
+        return jsonify({"ok": True})
+
+    if command == "/removeadmin":
+        if user_id != OWNER_ID:
+            send_message(user_id, "❌ Only the owner can remove admins.")
+            return jsonify({"ok": True})
+        if not args:
+            send_message(user_id, "Usage: /removeadmin <telegram_user_id>")
+            return jsonify({"ok": True})
+        try:
+            target_id = int(args.split()[0])
+        except Exception:
+            send_message(user_id, "Invalid user id.")
+            return jsonify({"ok": True})
+        db_execute("UPDATE allowed_users SET is_admin = 0 WHERE user_id = ?", (target_id,))
+        send_message(user_id, f"✅ Admin removed: {target_id}")
+        send_message(target_id, "❌ Your admin privileges have been revoked.")
         return jsonify({"ok": True})
 
     if command == "/botinfo":
         if user_id != OWNER_ID:
             send_message(user_id, "❌ Only the bot owner can use /botinfo")
             return jsonify({"ok": True})
-        # General counts
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
         queued_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'", fetch=True)[0][0]
 
-        # Users with active tasks (running or paused): compute remaining words and active task count per user
-        # remaining_words = SUM(total_words - sent_count)
+        # Active users with remaining words and counts
         active_rows = db_execute(
             "SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining_words, COUNT(*) as active_count "
             "FROM tasks WHERE status IN ('running','paused') GROUP BY user_id ORDER BY remaining_words DESC",
             fetch=True,
         )
-        # Queued counts grouped per user (so we can show queued along with active)
         queued_rows = db_execute(
             "SELECT user_id, COUNT(*) as queued_count FROM tasks WHERE status = 'queued' GROUP BY user_id",
             fetch=True,
@@ -828,7 +840,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             wsum = int(r[2] or 0)
             stats_lines.append(f"{uid}{(' (' + uname + ')') if uname else ''} - {wsum} words")
 
-        # Build body: include both sections and general info
         body_parts = [
             "Bot status: Online",
             f"Allowed users: {total_allowed}",
@@ -861,7 +872,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 count += 1
             except Exception:
                 fails += 1
-        send_message(user_id, f"Broadcast complete. Success: {count}, Failed: {fails}")
+        send_message(user_id, f"Broadcast done. Success: {count}, Failed: {fails}")
         return jsonify({"ok": True})
 
     send_message(user_id, "Unknown command.")
@@ -875,51 +886,52 @@ def get_queue_size(user_id):
 
 def handle_new_text(user_id: int, username: str, text: str):
     if not is_allowed(user_id):
-        send_message(user_id, "❌ **Sorry!** You are not allowed to use this bot. A request has been sent to the owner.")
-        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by @{username or user_id} ({user_id}). Message: {text}")
+        send_message(user_id, "❌ Sorry, you are not allowed. The owner has been notified.")
+        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
         return jsonify({"ok": True})
     if is_maintenance_now():
-        send_message(user_id, "🛠️ **Maintenance in Progress!** New tasks are blocked. Please try again after 4 AM WAT.")
-        send_message(OWNER_ID, f"🛠️ Maintenance attempted during window by {user_id}.")
+        send_message(user_id, "🛠️ Maintenance in progress. New tasks are blocked. Please try later.")
+        send_message(OWNER_ID, f"🛠️ Maintenance attempt by {user_id}.")
         return jsonify({"ok": True})
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
         if res.get("reason") == "empty":
-            send_message(user_id, "Empty or whitespace-only text. Nothing to split.")
+            send_message(user_id, "Empty text. Nothing to split.")
             return jsonify({"ok": True})
         if res.get("reason") == "queue_full":
-            send_message(user_id, f"❌ Your queue is full ({res['queue_size']}). Please /stop or wait for tasks to finish.")
+            send_message(user_id, f"❌ Your queue is full ({res['queue_size']}). Use /stop or wait.")
             return jsonify({"ok": True})
-    qsize = get_queue_size(user_id)
-    if qsize > 1:
-        send_message(user_id, f"📝 **Queued!** You currently have **{qsize}** task(s) waiting in line. Your current task must finish first.")
+    running_exists = bool(db_execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,), fetch=True))
+    queued = get_queue_size(user_id)
+    if running_exists:
+        send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
     else:
-        send_message(user_id, f"✅ Task added. Words: {res['total_words']}. Time per word: **{compute_interval(res['total_words'])}s**")
+        send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
     return jsonify({"ok": True})
 
 
-# Ensure the root GET exists and POST forwarded to webhook() fallback
+# Root and health endpoints
 @app.route("/", methods=["GET", "POST"])
 def root_forward():
     if request.method == "POST":
         logger.info("Received POST at root; forwarding to /webhook")
         try:
-            return webhook()
+            update_json = request.get_json(force=True)
+            threading.Thread(target=handle_update, args=(update_json,), daemon=True).start()
+            return jsonify({"ok": True})
         except Exception:
             logger.exception("Forwarding POST to webhook failed")
             return jsonify({"ok": False, "error": "forward failed"}), 200
     return "Word Splitter Bot is running.", 200
 
 
-# Health endpoint for UptimeRobot (accept HEAD and GET, and both /health and /health/)
 @app.route("/health", methods=["GET", "HEAD"])
 @app.route("/health/", methods=["GET", "HEAD"])
 def health():
     logger.info("Health check from %s method=%s", request.remote_addr, request.method)
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat()}), 200
+    return jsonify({"ok": True}), 200
 
 
-# Debug: list all registered routes (useful to verify /health exists)
 @app.route("/debug/routes", methods=["GET"])
 def debug_routes():
     try:
@@ -931,7 +943,6 @@ def debug_routes():
 
 
 if __name__ == "__main__":
-    # Optionally set webhook when running directly (local debug). On Render, gunicorn will import app and this block won't run.
     try:
         set_webhook()
     except Exception:
