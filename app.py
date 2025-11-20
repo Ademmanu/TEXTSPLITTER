@@ -2,14 +2,18 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) without python-telegram-bot.
 
-This file is the app implementation with the requested adjustments:
-- Removed the "🚀 Task queued and will start shortly." message before the first task starts.
-- Added /addadmin and /removeadmin commands (owner-only).
-- /adduser, /removeuser and /listusers are admin-accessible (admins or owner).
-- /botinfo, /broadcast, /addadmin and /removeadmin remain owner-only.
-- Updated welcome (/start) message to clearly show which commands are admin-only and owner-only.
-- Starting task notifications now include an estimated total time (no per-word speed shown).
-- Kept previous performance optimizations (async handling, session reuse, sent_count tracking).
+This is the updated app.py with an owner-only view that lists users who currently
+have active tasks, showing for each: user_id - active_words - active_tasks - queued_tasks.
+
+Key points:
+- The /botinfo command (owner-only) now includes a compact, efficient summary of users
+  with active tasks. For each such user it shows:
+    <user_id> - <active_words> words - <active_count> active - <queued_count> queued (username)
+- The implementation uses two grouped SQL queries (one for active tasks, one for queued tasks)
+  and merges results in memory — this minimizes DB round-trips and is fast.
+- Other performance features (requests.Session reuse, background handlers, sent_count tracking)
+  are preserved.
+
 Run with: gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
@@ -713,17 +717,39 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
         queued_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'", fetch=True)[0][0]
-        cutoff = datetime.utcnow() - timedelta(hours=1)
-        rows = db_execute("SELECT user_id, username, SUM(words) as s FROM split_logs WHERE created_at >= ? GROUP BY user_id ORDER BY s DESC", (cutoff.isoformat(),), fetch=True)
+
+        # Efficient grouped queries:
+        # 1) Active tasks grouped per user: sum total_words and count active tasks
+        active_rows = db_execute(
+            "SELECT user_id, username, SUM(total_words) as active_words, COUNT(*) as active_count "
+            "FROM tasks WHERE status IN ('running','paused') GROUP BY user_id ORDER BY active_words DESC",
+            fetch=True,
+        )
+        # 2) Queued counts grouped per user
+        queued_rows = db_execute(
+            "SELECT user_id, COUNT(*) as queued_count FROM tasks WHERE status = 'queued' GROUP BY user_id",
+            fetch=True,
+        )
+        queued_map = {r[0]: int(r[1]) for r in queued_rows}
+
+        # Build per-user lines only for users with active tasks to keep output focused and small
         peruser_lines = []
-        for r in rows:
-            peruser_lines.append(f"{r[0]} - {int(r[2] or 0)} words ({r[1] or ''})" if r[1] else f"{r[0]} - {int(r[2] or 0)} words")
+        for r in active_rows:
+            uid = r[0]
+            uname = r[1] or ""
+            active_words = int(r[2] or 0)
+            active_count = int(r[3] or 0)
+            queued_count = queued_map.get(uid, 0)
+            # Format: 123456789 - 50words - 1 active - 2 queue
+            name_part = f" ({uname})" if uname else ""
+            peruser_lines.append(f"{uid} - {active_words} words - {active_count} active - {queued_count} queued{name_part}")
+
         body = (
             f"Bot status: Online\n"
             f"Allowed users: {total_allowed}\n"
             f"Active tasks: {active_tasks}\n"
             f"Queued tasks: {queued_tasks}\n"
-            f"User stats (last 1h):\n" + ("\n".join(peruser_lines) if peruser_lines else "No activity")
+            f"Users with active tasks:\n" + ("\n".join(peruser_lines) if peruser_lines else "No active users")
         )
         send_message(user_id, body)
         return
@@ -778,7 +804,7 @@ def handle_new_text(user_id: int, username: str, text: str):
     if running_exists:
         send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
     else:
-        # Removed "🚀 Task queued and will start shortly." as requested.
+        # Removed "🚀 Task queued and will start shortly." as requested earlier.
         send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
     return
 
