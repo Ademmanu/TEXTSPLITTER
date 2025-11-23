@@ -5,14 +5,16 @@ Telegram Word-Splitter Bot (Webhook-ready) - app.py (updated)
 Changes in this version:
 - /stats now shows only the requesting user's words split in the last 12 hours.
 - /addadmin command added (owner-only) to grant admin rights to a user.
-- /adduser now supports adding multiple user IDs at once, does batch DB inserts inside a DB lock,
-  and sends notifications to newly added users with small delays to avoid Telegram rate-limits.
 - Admins are able to use /adduser and /listusers (unchanged behavior; preserved).
 - /removeuser can remove any user (including admins) from allowed_users.
 - All other behavior kept as in the previous app.py (tg_call rate-limiter, botinfo showing active users and last-1h stats, etc.)
-
-Run with:
-    gunicorn app:app --bind 0.0.0.0:$PORT
+- FIXES:
+  - more robust SQLite access with retries on "database is locked" (prevents intermittent failures when multiple requests/threads
+    write to the DB at once).
+  - improved /adduser: accepts multiple user ids in a single command (space- or comma-separated), reports which were added,
+    which already existed, and which failed. This avoids the "only first few added then repeats" symptom caused by race/lock
+    problems and gives clear feedback to the admin.
+  - clearer DB connect timeout to help avoid SQLITE_BUSY failures.
 """
 import os
 import time
@@ -23,7 +25,7 @@ import traceback
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
 import requests
@@ -66,7 +68,7 @@ _db_lock = threading.Lock()
 
 
 def init_db():
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
         # allowed users table
         c.execute(
@@ -135,14 +137,35 @@ def init_db():
                 logger.exception("Failed to add sent_count column (maybe already present)")
 
 
-def db_execute(query, params=(), fetch=False):
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(query, params)
-        if fetch:
-            rows = c.fetchall()
-            return rows
-        conn.commit()
+def db_execute(query, params=(), fetch=False, retries=6):
+    """
+    Central DB helper with locking + retry on OperationalError (e.g. database is locked).
+    Returns rows if fetch=True, otherwise returns None.
+    """
+    attempt = 0
+    delay = 0.05
+    while True:
+        try:
+            # single-use connection per call. 30s timeout helps SQLite wait for locks instead of immediate SQLITE_BUSY.
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute(query, params)
+                if fetch:
+                    rows = c.fetchall()
+                    return rows
+                conn.commit()
+                return None
+        except sqlite3.OperationalError as e:
+            # common transient error: database is locked — retry a few times with small backoff
+            attempt += 1
+            if attempt >= retries:
+                logger.exception("SQLite OperationalError after %d attempts: %s. Query: %s Params: %s", attempt, e, query, params)
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+        except Exception:
+            logger.exception("Unexpected DB error on query: %s params=%s", query, params)
+            raise
 
 
 # Initialize DB and ensure owner is allowed/admin
@@ -330,20 +353,6 @@ def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
     return None
 
 
-def safe_send_message(chat_id: int, text: str, parse_delay: float = 0.25):
-    """
-    Wrapper around send_message that catches exceptions and respects a small delay
-    to reduce hitting telegram rate limits when sending multiple messages quickly.
-    """
-    try:
-        res = send_message(chat_id, text)
-        time.sleep(parse_delay)
-        return res
-    except Exception:
-        logger.exception("safe_send_message failed for chat %s", chat_id)
-        return None
-
-
 def delete_message(chat_id: int, message_id: int):
     payload = {"chat_id": chat_id, "message_id": message_id}
     data = tg_call("deleteMessage", payload)
@@ -464,46 +473,6 @@ def is_admin(user_id: int) -> bool:
     if not rows:
         return False
     return bool(rows[0][0])
-
-
-# New helper: batch-add users safely inside a DB lock/transaction
-def add_users_batch(admin_id: int, targets: List[Tuple[int, str]]):
-    """
-    targets: list of tuples (user_id, username_or_empty)
-    Returns (added_list, skipped_list) where added_list is list of user_ids successfully added,
-    skipped_list is list of tuples (user_id, reason).
-    This runs inside a DB lock and commits once.
-    """
-    added = []
-    skipped = []
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        # get current count
-        c.execute("SELECT COUNT(*) FROM allowed_users")
-        cur_count = c.fetchone()[0] or 0
-        for uid, uname in targets:
-            if cur_count >= MAX_ALLOWED_USERS:
-                skipped.append((uid, "max_reached"))
-                continue
-            # check if exists
-            c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,))
-            if c.fetchone():
-                skipped.append((uid, "exists"))
-                continue
-            c.execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-                      (uid, uname or "", get_now_iso(), 0))
-            cur_count += 1
-            added.append(uid)
-        conn.commit()
-
-    # notify added users slowly to avoid hitting Telegram limits
-    for uid in added:
-        try:
-            safe_send_message(uid, "✅ You have been added. Send any text to start.", parse_delay=0.2)
-        except Exception:
-            logger.exception("Failed to notify new user %s", uid)
-
-    return added, skipped
 
 
 # Background worker to process tasks for users
@@ -763,38 +732,88 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /adduser <telegram_user_id> [username]  OR /adduser <id1> <id2> <id3>")
+            send_message(user_id, "Usage: /adduser <telegram_user_id> [username]  OR /adduser <id1> <id2> <id3>\nYou can separate IDs with spaces or commas.")
             return jsonify({"ok": True})
-        parts = args.split()
-        # If all tokens are numeric, treat as multiple IDs
-        if len(parts) > 1 and all(p.lstrip("-").isdigit() for p in parts):
-            targets = []
-            for p in parts:
-                try:
-                    tid = int(p)
-                except Exception:
-                    continue
-                targets.append((tid, ""))
-            added, skipped = add_users_batch(user_id, targets)
-            send_message(user_id, f"✅ Added {len(added)} user(s). Skipped: {len(skipped)}.")
-            return jsonify({"ok": True})
-        # Otherwise treat as single id possibly with username
-        try:
-            target_id = int(parts[0])
-        except Exception:
-            send_message(user_id, "Invalid user id. Must be numeric.")
-            return jsonify({"ok": True})
-        uname = parts[1] if len(parts) > 1 else ""
-        added, skipped = add_users_batch(user_id, [(target_id, uname)])
-        if added:
+
+        # Support multiple IDs in one message. Accept commas or spaces.
+        parts = re.split(r"[,\s]+", args.strip())
+        # If admin provided "id username", keep only the first part as id (original single-user behavior)
+        if len(parts) >= 2 and len(parts[0]) and parts[0].isdigit() and len(parts) == 2 and not parts[1].isdigit():
+            # Single add with username supplied
+            try:
+                target_id = int(parts[0])
+            except Exception:
+                send_message(user_id, "Invalid user id. Must be numeric.")
+                return jsonify({"ok": True})
+            uname = parts[1]
+            count_total = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
+            if count_total >= MAX_ALLOWED_USERS:
+                send_message(user_id, f"Cannot add more users. Max: {MAX_ALLOWED_USERS}")
+                return jsonify({"ok": True})
+            db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                       (target_id, uname, get_now_iso(), 0))
             send_message(user_id, f"✅ User {target_id} added.")
             try:
-                safe_send_message(target_id, "✅ You have been added. Send any text to start.")
+                send_message(target_id, "✅ You have been added. Send any text to start.")
             except Exception:
-                logger.exception("Failed to message newly added user %s", target_id)
-        else:
-            reason = skipped[0][1] if skipped else "unknown"
-            send_message(user_id, f"⚠️ User not added: {reason}")
+                logger.exception("Failed to notify newly added user %s", target_id)
+            return jsonify({"ok": True})
+
+        # Batch add mode (space/comma separated ids)
+        added = []
+        already = []
+        invalid = []
+        failed = []
+        # Get current total once and update locally
+        try:
+            current_total = int(db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0])
+        except Exception:
+            current_total = 0
+
+        for p in parts:
+            if not p:
+                continue
+            try:
+                target_id = int(p)
+            except Exception:
+                invalid.append(p)
+                continue
+            if current_total >= MAX_ALLOWED_USERS:
+                failed.append((target_id, "max_reached"))
+                break
+            try:
+                exists = db_execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (target_id,), fetch=True)
+                if exists:
+                    already.append(target_id)
+                    continue
+                db_execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                           (target_id, "", get_now_iso(), 0))
+                added.append(target_id)
+                current_total += 1
+            except Exception:
+                logger.exception("Failed to add user %s", target_id)
+                failed.append((target_id, "error"))
+
+        # Inform admin what happened
+        parts_msgs = []
+        if added:
+            parts_msgs.append(f"Added: {', '.join(str(x) for x in added)}")
+        if already:
+            parts_msgs.append(f"Already present: {', '.join(str(x) for x in already)}")
+        if invalid:
+            parts_msgs.append(f"Invalid ids: {', '.join(invalid)}")
+        if failed:
+            parts_msgs.append(f"Failed: {', '.join(str(x[0]) + '(' + x[1] + ')' for x in failed)}")
+
+        send_message(user_id, "✅ /adduser results:\n" + ("\n".join(parts_msgs) if parts_msgs else "(no changes)"))
+
+        # Try to notify newly added users
+        for tid in added:
+            try:
+                send_message(tid, "✅ You have been added. Send any text to start.")
+            except Exception:
+                logger.exception("Failed to notify newly added user %s", tid)
+
         return jsonify({"ok": True})
 
     if command == "/removeuser":
