@@ -2,18 +2,14 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) - app.py (updated)
 
-Changes in this version relative to the provided file:
-- Support multiple owners via OWNER_IDS env var (comma-separated). Backwards-compatible with single OWNER_ID.
-- Removed commands: /addadmin, /removeadmin, /removeuser (owner/admin cannot remove users via bot anymore).
-- Added suspension subsystem:
-  - New DB table suspended_users to store suspensions with expiry.
-  - Owner-only commands: /suspend <user_id> [duration] and /unsuspend <user_id>.
-  - /listsuspended command (admins + owners) to view current suspensions.
-  - Suspensions are honored in permission checks (is_allowed) and expire automatically (lazy cleanup on check).
-- Kept /adduser (admin command) for adding users (batch adds supported).
-- All other functionality preserved.
-- New: robust ALLOWED_USERS env var support (accepts ALLOWED_USERS or fallback allowed_users, logs parsing,
-  inserts numeric IDs into allowed_users DB table at startup, and respects MAX_ALLOWED_USERS).
+Changes in this version:
+- Support ALLOWED_USERS env var robustly (ALLOWED_USERS or fallback allowed_users) and insert those IDs into allowed_users at startup.
+- Send hourly reports and health notices to all configured owners (OWNER_IDS / OWNER_ID).
+- Automatic processing of expired suspensions:
+  - When a suspension expires, the user is notified that their suspension ended.
+  - All owners are notified that the user's suspension has been lifted.
+  - A scheduler job checks for expired suspensions every minute.
+- Emojified various user-facing replies (e.g. /listusers, /botinfo, usage messages, unknown command, etc.)
 """
 import os
 import time
@@ -460,6 +456,18 @@ def delete_message(chat_id: int, message_id: int):
     return data
 
 
+# helper: send same message to all configured owners
+def send_to_owners(text: str, parse_mode: str = "Markdown"):
+    if not OWNERS:
+        logger.warning("send_to_owners: no owners configured")
+        return
+    for oid in OWNERS:
+        try:
+            send_message(oid, text, parse_mode=parse_mode)
+        except Exception:
+            logger.exception("Failed to send owner message to %s", oid)
+
+
 def set_webhook():
     if not TELEGRAM_API or not WEBHOOK_URL:
         logger.warning("Cannot set webhook: TELEGRAM_TOKEN or WEBHOOK_URL not configured")
@@ -606,10 +614,44 @@ def get_suspended_row(target_id: int):
     return rows[0] if rows else None
 
 
-def cleanup_expired_suspensions():
-    # Remove any suspended rows where suspended_until <= now
+def process_expired_suspensions_notify():
+    """
+    Find any suspensions that have expired (suspended_until <= now),
+    remove them and notify the affected user and all owners about the lift.
+    """
     now_iso = get_now_iso()
-    db_execute("DELETE FROM suspended_users WHERE suspended_until <= ?", (now_iso,))
+    rows = db_execute("SELECT user_id, suspended_until, reason, added_by, added_at FROM suspended_users WHERE suspended_until <= ?", (now_iso,), fetch=True)
+    if not rows:
+        return
+    for r in rows:
+        try:
+            uid = r[0]
+            until = r[1] or ""
+            reason = r[2] or ""
+            added_by = r[3] or ""
+            added_at = r[4] or ""
+            # remove the row for this user (so we only notify once)
+            try:
+                unsuspend_user_in_db(uid)
+            except Exception:
+                logger.exception("Failed to remove expired suspension for %s", uid)
+            # notify user
+            try:
+                send_message(uid, f"✅ Your suspension ended at {until} UTC. You can use the bot again.")
+            except Exception:
+                logger.exception("Failed to notify user about suspension end %s", uid)
+            # notify all owners
+            try:
+                send_to_owners(f"ℹ️ Suspension expired: {uid} suspended_until={until} added_by={added_by} at={added_at} reason={reason}")
+            except Exception:
+                logger.exception("Failed to notify owners about expired suspension for %s", uid)
+        except Exception:
+            logger.exception("Error processing expired suspension row: %s", r)
+
+
+def cleanup_expired_suspensions():
+    # Backward-compatible: perform notification-aware cleanup.
+    process_expired_suspensions_notify()
 
 
 def is_suspended(user_id: int) -> bool:
@@ -631,7 +673,11 @@ def is_suspended(user_id: int) -> bool:
         return False
     if datetime.utcnow() >= until:
         # expired -> cleanup and not suspended
-        unsuspend_user_in_db(user_id)
+        # perform notify and delete via process_expired_suspensions_notify to ensure owners get notified
+        try:
+            process_expired_suspensions_notify()
+        except Exception:
+            logger.exception("Failed to process expired suspensions during is_suspended check")
         return False
     return True
 
@@ -767,7 +813,7 @@ def hourly_owner_stats():
     cutoff = datetime.utcnow() - timedelta(hours=1)
     rows = db_execute("SELECT user_id, username, SUM(words) as s FROM split_logs WHERE created_at >= ? GROUP BY user_id ORDER BY s DESC", (cutoff.isoformat(),), fetch=True)
     if not rows:
-        send_message(OWNER_ID, "🕐 Last 1 hour: no splits.")
+        send_to_owners("🕐 Last 1 hour: no splits.")
         return
     lines = []
     total_words = 0
@@ -778,7 +824,7 @@ def hourly_owner_stats():
         total_words += wsum
         lines.append(f"{uid} - {wsum} words ({uname})" if uname else f"{uid} - {wsum} words")
     body = "🕐 Last 1 hour activity:\n" + "\n".join(lines) + f"\n\nTotal words: {total_words}"
-    send_message(OWNER_ID, body)
+    send_to_owners(body)
 
 
 def delete_old_bot_messages():
@@ -791,9 +837,11 @@ def delete_old_bot_messages():
 
 
 def maintenance_hourly_health():
-    send_message(OWNER_ID, "👑 Bot health: running.")
+    send_to_owners("👑 Bot health: running.")
 
 
+# Run expiration processor every minute
+scheduler.add_job(process_expired_suspensions_notify, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=5))
 scheduler.add_job(hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10))
 scheduler.add_job(delete_old_bot_messages, "interval", minutes=30, next_run_time=datetime.utcnow() + timedelta(seconds=20))
 scheduler.add_job(maintenance_hourly_health, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=15))
@@ -835,11 +883,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # allow /start and /help for anyone; otherwise check allowed (and suspended)
     if not is_allowed(user_id) and command not in ("/start", "/help"):
         send_message(user_id, "❌ Sorry, you are not allowed to use this bot. The owner has been notified.")
-        # notify the primary owner (legacy behavior)
+        # notify the primary owner (legacy behavior) and all owners
         try:
-            send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
+            # keep legacy single-owner notify for compatibility and also notify all owners
+            if OWNER_ID:
+                send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
+            send_to_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
         except Exception:
-            logger.exception("Failed to notify owner about unallowed access")
+            logger.exception("Failed to notify owner(s) about unallowed access")
         return jsonify({"ok": True})
 
     if command == "/start":
@@ -856,7 +907,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     if command == "/example":
         sample = "This is a demo split"
-        send_message(user_id, "Running a short example...")
+        send_message(user_id, "🎯 Running a short example...")
         res = enqueue_task(user_id, username, sample)
         running_exists = bool(db_execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,), fetch=True))
         queued = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
@@ -905,7 +956,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         queued_count = queued_rows[0][0] if queued_rows else 0
         stopped = cancel_active_task_for_user(user_id)
         if stopped > 0:
-            send_message(user_id, "🛑 Active task stopped. Your queued tasks have been cleared too.")
+            send_message(user_id, "🛑 Active task stopped. Your queued tasks were cleared too.")
         elif queued_count > 0:
             db_execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'queued'", (user_id,))
             send_message(user_id, f"🛑 Cleared {queued_count} queued task(s).")
@@ -923,7 +974,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     if command == "/about":
         body = (
-            "About:\nI split texts into single-word messages. Features: queueing, pause/resume, hourly owner stats, auto-delete old bot messages.\n"
+            "ℹ️ About:\nI split texts into single-word messages. Features: queueing, pause/resume, hourly owner stats, auto-delete old bot messages.\n"
             f"Developer: @{OWNER_USERNAME}"
         )
         send_message(user_id, body)
@@ -935,7 +986,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /adduser <telegram_user_id> [username]  OR /adduser <id1> <id2> <id3>\nYou can separate IDs with spaces or commas.")
+            send_message(user_id, "ℹ️ Usage: /adduser <telegram_user_id> [username]  OR /adduser <id1> <id2> <id3>\nYou can separate IDs with spaces or commas.")
             return jsonify({"ok": True})
 
         # Support multiple IDs in one message. Accept commas or spaces.
@@ -946,12 +997,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             try:
                 target_id = int(parts[0])
             except Exception:
-                send_message(user_id, "Invalid user id. Must be numeric.")
+                send_message(user_id, "❌ Invalid user id. Must be numeric.")
                 return jsonify({"ok": True})
             uname = parts[1]
             count_total = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
             if count_total >= MAX_ALLOWED_USERS:
-                send_message(user_id, f"Cannot add more users. Max: {MAX_ALLOWED_USERS}")
+                send_message(user_id, f"❌ Cannot add more users. Max: {MAX_ALLOWED_USERS}")
                 return jsonify({"ok": True})
             db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
                        (target_id, uname, get_now_iso(), 0))
@@ -1000,13 +1051,13 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         # Inform admin what happened
         parts_msgs = []
         if added:
-            parts_msgs.append(f"Added: {', '.join(str(x) for x in added)}")
+            parts_msgs.append(f"✅ Added: {', '.join(str(x) for x in added)}")
         if already:
-            parts_msgs.append(f"Already present: {', '.join(str(x) for x in already)}")
+            parts_msgs.append(f"ℹ️ Already present: {', '.join(str(x) for x in already)}")
         if invalid:
-            parts_msgs.append(f"Invalid ids: {', '.join(invalid)}")
+            parts_msgs.append(f"❌ Invalid ids: {', '.join(invalid)}")
         if failed:
-            parts_msgs.append(f"Failed: {', '.join(str(x[0]) + '(' + x[1] + ')' for x in failed)}")
+            parts_msgs.append(f"⚠️ Failed: {', '.join(str(x[0]) + '(' + x[1] + ')' for x in failed)}")
 
         send_message(user_id, "✅ /adduser results:\n" + ("\n".join(parts_msgs) if parts_msgs else "(no changes)"))
 
@@ -1026,8 +1077,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True)
         lines = []
         for r in rows:
-            lines.append(f"{r[0]} {r[1] or ''} admin={bool(r[2])} added={r[3]}")
-        body = "Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
+            uid = r[0]
+            uname = r[1] or ""
+            is_admin_flag = True if r[2] else False
+            admin_mark = "🛡️" if is_admin_flag else ""
+            lines.append(f"{uid} {uname} {admin_mark} added={r[3]}")
+        body = "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
         send_message(user_id, body)
         return jsonify({"ok": True})
 
@@ -1037,19 +1092,19 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "❌ Only the owner(s) can suspend users.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /suspend <telegram_user_id> [duration]\nDuration examples: 1h, 30m, 3600 (seconds). Default: 1h")
+            send_message(user_id, "ℹ️ Usage: /suspend <telegram_user_id> [duration]\nDuration examples: 1h, 30m, 3600 (seconds). Default: 1h")
             return jsonify({"ok": True})
         parts = args.split(None, 1)
         try:
             target_id = int(parts[0])
         except Exception:
-            send_message(user_id, "Invalid user id.")
+            send_message(user_id, "❌ Invalid user id.")
             return jsonify({"ok": True})
         duration_seconds = None
         if len(parts) > 1 and parts[1].strip():
             duration_seconds = parse_duration_to_seconds(parts[1].strip())
             if duration_seconds is None:
-                send_message(user_id, "Invalid duration. Use e.g. 1h, 30m, 3600 (seconds), 1d.")
+                send_message(user_id, "❌ Invalid duration. Use e.g. 1h, 30m, 3600 (seconds), 1d.")
                 return jsonify({"ok": True})
         else:
             duration_seconds = 3600  # default 1 hour
@@ -1061,6 +1116,11 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(target_id, f"❌ You have been suspended until {until.isoformat()} UTC. Contact the owner for more info.")
         except Exception:
             logger.exception("Failed to notify suspended user %s", target_id)
+        # notify all owners about the suspension action
+        try:
+            send_to_owners(f"⚠️ User suspended: {target_id} suspended_until={until.isoformat()} by={user_id}")
+        except Exception:
+            logger.exception("Failed to notify owners about suspension for %s", target_id)
         return jsonify({"ok": True})
 
     if command == "/unsuspend":
@@ -1068,12 +1128,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "❌ Only the owner(s) can unsuspend users.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /unsuspend <telegram_user_id>")
+            send_message(user_id, "ℹ️ Usage: /unsuspend <telegram_user_id>")
             return jsonify({"ok": True})
         try:
             target_id = int(args.split()[0])
         except Exception:
-            send_message(user_id, "Invalid user id.")
+            send_message(user_id, "❌ Invalid user id.")
             return jsonify({"ok": True})
         row = get_suspended_row(target_id)
         if not row:
@@ -1085,6 +1145,11 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(target_id, "✅ You have been unsuspended and can use the bot again.")
         except Exception:
             logger.exception("Failed to notify unsuspended user %s", target_id)
+        # notify all owners that manual unsuspend occurred (user and invoking owner already notified)
+        try:
+            send_to_owners(f"ℹ️ Manual unsuspend: {target_id} unsuspended by {user_id}.")
+        except Exception:
+            logger.exception("Failed to notify owners about manual unsuspend for %s", target_id)
         return jsonify({"ok": True})
 
     # Admin + owner: list suspended users
@@ -1095,7 +1160,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         cleanup_expired_suspensions()
         rows = db_execute("SELECT user_id, suspended_until, reason, added_by, added_at FROM suspended_users ORDER BY suspended_until ASC", fetch=True)
         if not rows:
-            send_message(user_id, "No suspended users.")
+            send_message(user_id, "✅ No suspended users.")
             return jsonify({"ok": True})
         lines = []
         for r in rows:
@@ -1104,8 +1169,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             reason = r[2] or ""
             added_by = r[3] or ""
             added_at = r[4] or ""
-            lines.append(f"{uid} suspended_until={until} by={added_by} at={added_at} reason={reason}")
-        send_message(user_id, "Suspended users:\n" + "\n".join(lines))
+            lines.append(f"⛔ {uid} suspended_until={until} by={added_by} at={added_at} reason={reason}")
+        send_message(user_id, "⛔ Suspended users:\n" + "\n".join(lines))
         return jsonify({"ok": True})
 
     if command == "/botinfo":
@@ -1157,16 +1222,16 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         suspended_count = db_execute("SELECT COUNT(*) FROM suspended_users", fetch=True)[0][0]
 
         body_parts = [
-            "Bot status: Online",
-            f"Allowed users: {total_allowed}",
-            f"Suspended users: {suspended_count}",
-            f"Active tasks: {active_tasks}",
-            f"Queued tasks: {queued_tasks}",
+            "🟢 Bot status: Online",
+            f"👥 Allowed users: {total_allowed}",
+            f"⛔ Suspended users: {suspended_count}",
+            f"⚙️ Active tasks: {active_tasks}",
+            f"📝 Queued tasks: {queued_tasks}",
             "",
-            "Users with active tasks:",
+            "👤 Users with active tasks:",
             "\n".join(peruser_active_lines) if peruser_active_lines else "No active users",
             "",
-            "User stats (last 1h):",
+            "📊 User stats (last 1h):",
             "\n".join(stats_lines) if stats_lines else "No activity in the last 1h",
         ]
         body = "\n".join(body_parts)
@@ -1178,7 +1243,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "❌ Only owner can broadcast")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /broadcast <message>")
+            send_message(user_id, "ℹ️ Usage: /broadcast <message>")
             return jsonify({"ok": True})
         rows = db_execute("SELECT user_id FROM allowed_users", fetch=True)
         count = 0
@@ -1189,10 +1254,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 count += 1
             except Exception:
                 fails += 1
-        send_message(user_id, f"Broadcast done. Success: {count}, Failed: {fails}")
+        send_message(user_id, f"📣 Broadcast done. Success: {count}, Failed: {fails}")
         return jsonify({"ok": True})
 
-    send_message(user_id, "Unknown command.")
+    send_message(user_id, "❓ Unknown command.")
     return jsonify({"ok": True})
 
 
@@ -1205,21 +1270,23 @@ def handle_new_text(user_id: int, username: str, text: str):
     if not is_allowed(user_id):
         send_message(user_id, "❌ Sorry, you are not allowed. The owner has been notified.")
         try:
-            send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
+            if OWNER_ID:
+                send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
+            send_to_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
         except Exception:
             logger.exception("Failed to notify owner about unallowed message")
         return jsonify({"ok": True})
     if is_maintenance_now():
         send_message(user_id, "🛠️ Maintenance in progress. New tasks are blocked. Please try later.")
         try:
-            send_message(OWNER_ID, f"🛠️ Maintenance attempt by {user_id}.")
+            send_to_owners(f"🛠️ Maintenance attempt by {user_id}.")
         except Exception:
             logger.exception("Failed to notify owner about maintenance attempt")
         return jsonify({"ok": True})
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
         if res.get("reason") == "empty":
-            send_message(user_id, "Empty text. Nothing to split.")
+            send_message(user_id, "⚠️ Empty text. Nothing to split.")
             return jsonify({"ok": True})
         if res.get("reason") == "queue_full":
             send_message(user_id, f"❌ Your queue is full ({res['queue_size']}). Use /stop or wait.")
