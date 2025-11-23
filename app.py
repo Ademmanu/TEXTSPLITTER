@@ -12,8 +12,8 @@ Changes in this version relative to the provided file:
   - Suspensions are honored in permission checks (is_allowed) and expire automatically (lazy cleanup on check).
 - Kept /adduser (admin command) for adding users (batch adds supported).
 - All other functionality preserved.
-- New: support ALLOWED_USERS env var (comma/space separated ids). These IDs are inserted into allowed_users
-  on startup and behave like users added with /adduser (they can be suspended by owners).
+- New: robust ALLOWED_USERS env var support (accepts ALLOWED_USERS or fallback allowed_users, logs parsing,
+  inserts numeric IDs into allowed_users DB table at startup, and respects MAX_ALLOWED_USERS).
 """
 import os
 import time
@@ -204,41 +204,78 @@ try:
                 db_execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (oid,))
 
     # Add any preconfigured allowed users from ALLOWED_USERS env var (comma/space separated ids).
-    # These behave like users added with /adduser and therefore can be suspended by the owner.
-    _allowed_users_raw = os.environ.get("ALLOWED_USERS", "")
+    # This block is defensive: accepts ALLOWED_USERS (uppercase) or fallback allowed_users (lowercase),
+    # logs the raw value and parsing results, inserts numeric IDs into allowed_users unless they already exist,
+    # are owners, or MAX_ALLOWED_USERS has been reached.
+    _allowed_users_raw = os.environ.get("ALLOWED_USERS")
+    if not _allowed_users_raw:
+        _allowed_users_raw = os.environ.get("allowed_users", "")
+    if _allowed_users_raw is None:
+        _allowed_users_raw = ""
+
     if _allowed_users_raw:
-        ids = [p.strip() for p in re.split(r"[,\s]+", _allowed_users_raw) if p and p.strip().isdigit()]
+        logger.info("ALLOWED_USERS env raw value: %s", _allowed_users_raw)
+        parts = [p.strip() for p in re.split(r"[,\s]+", _allowed_users_raw) if p and p.strip()]
+        numeric_ids = []
+        invalid_parts = []
+        for p in parts:
+            # allow optional leading +, and accept only digits otherwise
+            m = re.match(r"^\+?(\d+)$", p)
+            if m:
+                try:
+                    numeric_ids.append(int(m.group(1)))
+                except Exception:
+                    invalid_parts.append(p)
+            else:
+                invalid_parts.append(p)
+
+        if invalid_parts:
+            logger.warning("ALLOWED_USERS: ignored invalid entries: %s", ", ".join(invalid_parts))
+
         try:
             current_total = int(db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0])
         except Exception:
             current_total = 0
+            logger.exception("ALLOWED_USERS: failed to read current allowed_users count; assuming 0")
+
         added_env = []
-        for pid in ids:
-            try:
-                uid = int(pid)
-            except Exception:
-                continue
-            # skip if owner already present (owners are already ensured above)
+        skipped_existing = []
+        skipped_owner = []
+        skipped_max = []
+
+        for uid in numeric_ids:
+            # skip if owner (owners are already ensured above)
             if uid in OWNERS:
+                skipped_owner.append(uid)
                 continue
             exists = db_execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,), fetch=True)
             if exists:
+                skipped_existing.append(uid)
                 continue
             if current_total >= MAX_ALLOWED_USERS:
-                logger.warning("Skipping ALLOWED_USERS %s: max allowed users (%d) reached", uid, MAX_ALLOWED_USERS)
+                skipped_max.append(uid)
+                logger.warning("ALLOWED_USERS: skipping %s because MAX_ALLOWED_USERS (%d) reached", uid, MAX_ALLOWED_USERS)
                 break
             try:
                 db_execute(
                     "INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-                    (uid, "", get_now_iso(), 0),
+                    (uid, "", datetime.utcnow().isoformat(), 0),
                 )
                 added_env.append(uid)
                 current_total += 1
             except Exception:
-                logger.exception("Failed to add ALLOWED_USERS id %s from env", uid)
+                logger.exception("ALLOWED_USERS: failed to insert id %s", uid)
+
         if added_env:
             logger.info("Added ALLOWED_USERS from environment: %s", ", ".join(str(x) for x in added_env))
-
+        if skipped_existing:
+            logger.info("ALLOWED_USERS: already present (skipped): %s", ", ".join(str(x) for x in skipped_existing))
+        if skipped_owner:
+            logger.info("ALLOWED_USERS: skipped owner ids: %s", ", ".join(str(x) for x in skipped_owner))
+        if skipped_max:
+            logger.info("ALLOWED_USERS: skipped due to MAX_ALLOWED_USERS limit: %s", ", ".join(str(x) for x in skipped_max))
+    else:
+        logger.debug("No ALLOWED_USERS env var set.")
 except Exception:
     logger.exception("Error ensuring owners in allowed_users")
 
