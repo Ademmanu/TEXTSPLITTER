@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
+import psutil
 import requests
 import traceback
 
@@ -1004,6 +1005,26 @@ def set_webhook():
         _session.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL}, timeout=REQUESTS_TIMEOUT)
     except Exception:
         logger.exception("set_webhook failed")
+        
+@app.route("/mem", methods=["GET"])
+def mem_usage():
+    process = psutil.Process()
+    mem_used_mb = process.memory_info().rss / (1024 * 1024)
+    return f"Memory used by app: {mem_used_mb:.2f} MB\n"
+
+@app.route("/sysmem", methods=["GET"])
+def system_memory():
+    vm = psutil.virtual_memory()
+    total = vm.total / (1024 * 1024)
+    available = vm.available / (1024 * 1024)
+    used = vm.used / (1024 * 1024)
+    percent = vm.percent
+    return (
+        f"Total system RAM: {total:.2f} MB\n"
+        f"Available RAM: {available:.2f} MB\n"
+        f"Used RAM: {used:.2f} MB\n"
+        f"Usage percent: {percent}%\n"
+    )
 
 if __name__ == "__main__":
     try:
