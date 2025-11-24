@@ -538,7 +538,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 send_message(chat_id, "✅ Done splitting! 🎉 Your text was successfully sent word by word!")
             else:
                 # EMOJI-RICH REPLY
-                send_message(chat_id, "🛑 Task manually stopped or cancelled due to error.")
+                send_message(chat_id, "🛑 Task manually stopped")
     finally:
         lock.release()
 
