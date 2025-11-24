@@ -10,10 +10,10 @@ Features implemented per user request:
 - Hourly owner stats (last 1 hour) sent automatically and included in /botinfo
 - /help removed completely
 - Bot-health hourly reports removed
-- Simplified, shorter replies and ~20% fewer emojis compared to earlier versions (OVERRIDDEN BY 80% EMOJI REQUIREMENT)
+- Simplified, shorter replies and ~20% fewer emojis compared to earlier versions
 - Suspensions enforce immediately and cancel running/queued tasks
 - Timestamps formatted as "YYYY-MM-DD HH:MM:SS"
-- Emojified replies but toned down (OVERRIDDEN BY 80% EMOJI REQUIREMENT)
+- Emojified replies but toned down
 """
 
 import os
@@ -175,8 +175,7 @@ for uid in parse_id_list(ALLOWED_USERS_RAW):
             # best-effort notify
             try:
                 if TELEGRAM_API:
-                    # EMOJI-RICH REPLY
-                    _session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": uid, "text": "🎉 You were added via ALLOWED_USERS! 👋 Welcome aboard!"}, timeout=3)
+                    _session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": uid, "text": "You were added via ALLOWED_USERS. Hello! 👋"}, timeout=3)
             except Exception:
                 pass
     except Exception:
@@ -211,7 +210,7 @@ def parse_telegram_json(resp):
 # Normal send with token bucket and limited retry/backoff
 def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
     if not TELEGRAM_API:
-        logger.error("No TELEGRAM_TOKEN; cannot send message.")
+        logger.error("No TELEGRAM_TOKEN; cannot send message. 🛑")
         return None
     # acquire token (best-effort)
     acquire_token(timeout=5.0)
@@ -219,7 +218,7 @@ def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
     try:
         resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
     except Exception as e:
-        logger.exception("Network send error")
+        logger.exception("Network send error 📡")
         increment_failure(chat_id)
         return None
     data = parse_telegram_json(resp)
@@ -234,7 +233,7 @@ def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
                               (chat_id, mid, now_ts()))
                     conn.commit()
         except Exception:
-            logger.exception("record sent message failed")
+            logger.exception("record sent message failed 📝")
         reset_failures(chat_id)
         return data["result"]
     else:
@@ -257,11 +256,10 @@ def increment_failure(user_id: int):
                           (failures, now_ts(), user_id))
             conn.commit()
         if failures >= 6:
-            # EMOJI-RICH REPLY
-            notify_owners(f"⚠️ Repeated send failures for {user_id} ({failures})! 🛑 Stopping their tasks immediately.")
+            notify_owners(f"⚠️ Repeated send failures for {user_id} ({failures}). Stopping their tasks. 🛑")
             cancel_active_task_for_user(user_id)
     except Exception:
-        logger.exception("increment_failure error")
+        logger.exception("increment_failure error 📈")
 
 def reset_failures(user_id: int):
     try:
@@ -280,7 +278,7 @@ def broadcast_send_raw(chat_id: int, text: str):
     try:
         resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
     except Exception as e:
-        logger.info("Broadcast network error to %s: %s", chat_id, e)
+        logger.info("Broadcast network error to %s: %s 📡", chat_id, e)
         return False, str(e)
     data = parse_telegram_json(resp)
     if data and data.get("ok"):
@@ -296,7 +294,7 @@ def broadcast_send_raw(chat_id: int, text: str):
             pass
         return True, "ok"
     reason = data.get("description") if isinstance(data, dict) else "error"
-    logger.info("Broadcast failed to %s: %s", chat_id, reason)
+    logger.info("Broadcast failed to %s: %s ❌", chat_id, reason)
     return False, reason
 
 # Task queue management
@@ -381,12 +379,10 @@ def suspend_user(target_id: int, seconds: int, reason: str = ""):
         conn.commit()
     stopped = cancel_active_task_for_user(target_id)
     try:
-        # EMOJI-RICH REPLY
-        send_message(target_id, f"⛔ You were suspended until {until} UTC! ⏳\nReason: {reason or '(_No reason provided_) 🤷'}")
+        send_message(target_id, f"⛔ You were suspended until *{until} UTC*.\nReason: {reason or '(none)'} 🚫")
     except Exception:
         logger.exception("notify suspended user failed")
-    # EMOJI-RICH REPLY
-    notify_owners(f"⛔ User {target_id} suspended until {until} UTC! 🛑 Stopped {stopped} tasks. Reason: {reason or '(_none_)'} 📝")
+    notify_owners(f"⛔ User {target_id} suspended until {until} UTC. Stopped {stopped} tasks. Reason: {reason or '(none)'} 🛑")
 
 def unsuspend_user(target_id: int) -> bool:
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -398,12 +394,10 @@ def unsuspend_user(target_id: int) -> bool:
         c.execute("DELETE FROM suspended_users WHERE user_id = ?", (target_id,))
         conn.commit()
     try:
-        # EMOJI-RICH REPLY
-        send_message(target_id, "✅ Your suspension has been lifted! 🥳 You may use the bot again!")
+        send_message(target_id, "✅ Your suspension has been lifted. You may use the bot again. 🎉")
     except Exception:
         logger.exception("notify unsuspended failed")
-    # EMOJI-RICH REPLY
-    notify_owners(f"✅ User {target_id} unsuspended! 🎉")
+    notify_owners(f"✅ User {target_id} unsuspended. 👍")
     return True
 
 def list_suspended():
@@ -443,8 +437,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
     try:
         if is_suspended(user_id):
             try:
-                # EMOJI-RICH REPLY
-                send_message(user_id, "⛔ You are suspended! ⏳ Tasks won't run until the suspension ends. 🚫")
+                send_message(user_id, "⛔ You are suspended — tasks won't run until suspension ends. ⏳")
             except Exception:
                 pass
             return
@@ -453,8 +446,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             if not task:
                 break
             if is_suspended(user_id):
-                # EMOJI-RICH REPLY
-                send_message(user_id, "⛔ You were suspended during processing! Tasks cancelled. 🚫")
+                send_message(user_id, "⛔ You are suspended. Tasks paused/cancelled. 🚫")
                 break
             task_id = task["id"]
             words = task["words"]
@@ -470,8 +462,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             interval = 0.4 if total <= 150 else (0.5 if total <= 300 else 0.6)
             est_seconds = int(remaining * interval)
             est_str = str(timedelta(seconds=est_seconds))
-            # EMOJI-RICH REPLY
-            send_message(chat_id, f"🚀 Starting split now! Total words: {total} 📝. Estimated time: {est_str} ⏱️.")
+            send_message(chat_id, f"🚀 Starting split: *{total}* words. Est: *{est_str}*. ⏱️")
             i = sent
             consecutive_failures = 0
             while i < total:
@@ -484,8 +475,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                     break
                 status = row[0]
                 if status == "paused":
-                    # EMOJI-RICH REPLY
-                    send_message(chat_id, "⏸️ Paused! Use /resume to continue splitting. ▶️")
+                    send_message(chat_id, "⏸️ Paused. Use /resume to continue. 🧘")
                     while True:
                         time.sleep(0.5)
                         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -495,8 +485,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                         if not row2:
                             break
                         if row2[0] == "running":
-                            # EMOJI-RICH REPLY
-                            send_message(chat_id, "▶️ Resuming the task!")
+                            send_message(chat_id, "▶️ Resuming. 🏃‍♂️")
                             break
                         if row2[0] == "cancelled":
                             break
@@ -508,8 +497,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 if res is None:
                     consecutive_failures += 1
                     if consecutive_failures >= 4:
-                        # EMOJI-RICH REPLY
-                        notify_owners(f"⚠️ Repeated send failures for {user_id}! 🚨 Stopping tasks.")
+                        notify_owners(f"⚠️ Repeated send failures for {user_id}. Stopping tasks. 🛑")
                         cancel_active_task_for_user(user_id)
                         break
                 else:
@@ -534,11 +522,9 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             if final_status != "cancelled":
                 set_task_status(task_id, "done")
                 record_split_log(user_id, username, sent_count)
-                # EMOJI-RICH REPLY
-                send_message(chat_id, "✅ Done splitting! 🎉 Your text was successfully sent word by word!")
+                send_message(chat_id, "✅ Done! Your text was split. 🎉")
             else:
-                # EMOJI-RICH REPLY
-                send_message(chat_id, "🛑 Task manually stopped")
+                send_message(chat_id, "🛑 Task stopped. ❌")
     finally:
         lock.release()
 
@@ -558,7 +544,7 @@ def global_worker():
                 t.start()
             time.sleep(0.6)
         except Exception:
-            logger.exception("global worker error")
+            logger.exception("global worker error ⚙️")
             time.sleep(1.0)
 
 threading.Thread(target=global_worker, daemon=True).start()
@@ -577,8 +563,7 @@ def compute_last_hour_stats():
 def send_hourly_owner_stats():
     rows = compute_last_hour_stats()
     if not rows:
-        # EMOJI-RICH REPLY
-        msg = "⏰ Hourly Report: last 1h ⏳ — no splits were performed."
+        msg = "⏰ Hourly Report — last 1h: no splits. 😌"
         for oid in OWNER_IDS:
             try:
                 send_message(oid, msg)
@@ -590,9 +575,9 @@ def send_hourly_owner_stats():
         uid = r[0]
         uname = r[1] or ""
         w = int(r[2] or 0)
-        part = f"{uid} ({uname}) - {w} words 📝" if uname else f"{uid} - {w} words 📝"
+        part = f"{uid} ({uname}) - {w} words" if uname else f"{uid} - {w} words"
         lines.append(part)
-    body = "⏰ Hourly Report — last 1h activity: 📊\n" + "\n".join(lines)
+    body = "⏰ Hourly Report — last 1h:\n" + "\n".join(lines) + " 📊"
     for oid in OWNER_IDS:
         try:
             send_message(oid, body)
@@ -613,7 +598,7 @@ def check_and_lift():
                 uid = r[0]
                 unsuspend_user(uid)
         except Exception:
-            logger.exception("suspend parse error for %s", r)
+            logger.exception("suspend parse error for %s 🚧", r)
 
 # Job registration
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10))
@@ -624,16 +609,9 @@ scheduler.start()
 def notify_owners(text: str):
     for oid in OWNER_IDS:
         try:
-            send_message(oid, f"👑 {text} 🚨")
+            send_message(oid, f"👑 {text}")
         except Exception:
-            logger.exception("notify owner failed for %s", oid)
-
-# Utility to get queued count (Moved up to fix definition order for /botinfo)
-def get_queued_for_user(user_id: int) -> int:
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
-        return c.fetchone()[0]
+            logger.exception("notify owner failed for %s 🚨", oid)
 
 # Webhook endpoints
 @app.route("/webhook", methods=["POST"])
@@ -657,7 +635,7 @@ def webhook():
             else:
                 return handle_user_text(uid, username, text)
     except Exception:
-        logger.exception("webhook handling error")
+        logger.exception("webhook handling error 💥")
     return jsonify({"ok": True})
 
 @app.route("/", methods=["GET"])
@@ -666,43 +644,37 @@ def root():
 
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
-    return jsonify({"ok": True, "ts": now_ts(), "status": "💚"}), 200
+    return jsonify({"ok": True, "ts": now_ts()}), 200
 
 # Command handlers
 def handle_command(user_id: int, username: str, command: str, args: str):
     # /start allowed for anyone
     if command == "/start":
         msg = (
-            f"👋 Hello there, {username or user_id}! 🎉\n\n"
-            "I'm the WordSplitter Bot 🤖 — I turn your text into individual, word-by-word messages! 💬\n\n"
-            "Just send me anything! 📝 I'll start splitting immediately. 🚀\n"
-            "Need a preview? Try /example! 👀"
+            f"👋 Hello {username or user_id}! I'm glad you're here. 😊\n\n"
+            "I am WordSplitter Bot — I can split any text you send into single-word messages, "
+            "making it easier to read or process. 🤖\n\n"
+            "Just send me a message, and I'll start splitting it word by word. 📝\n"
+            "You can also try /example to see a demo. 💡"
         )
         send_message(user_id, msg)
         return jsonify({"ok": True})
 
     # require allowed for other commands
     if not is_allowed(user_id):
-        # EMOJI-RICH REPLY
-        send_message(user_id, "❌ Sorry! You're not allowed to use this bot. 🔒 Owner (@justmemmy) has been notified.")
-        notify_owners(f"❌ Unallowed access attempt by {username or user_id} ({user_id}). 🕵️")
+        send_message(user_id, "❌ You are not allowed to use this bot. Owner has been notified. 🚨")
+        notify_owners(f"Unallowed access attempt by {username or user_id} ({user_id}). 🚫")
         return jsonify({"ok": True})
 
     # User commands
     if command == "/example":
-        # ⭐ MODIFICATION: NEW SAMPLE TEXT ⭐
-        sample = (
-            "996770061141 996770064514 996770071665 996770073284 "
-            "996770075145 996770075627 996770075973 996770076350 "
-            "996770076869 996770077198"
-        )
+        # CHANGED: Sample text for /example
+        sample = "447781515818 447781515819 447781515820 447781515821 447781515822 447781515823 447781515824 447781515825 447781515826 447781515827"
         res = enqueue_task(user_id, username, sample)
         if not res["ok"]:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "🚫 Could not queue the demo! Try again later. 🕰️")
+            send_message(user_id, "Could not queue demo. Try later. 😔")
             return jsonify({"ok": True})
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"🎉 Demo queued! Will split {res['total_words']} words! 🚀")
+        send_message(user_id, f"Demo queued — will split {res['total_words']} words. 🔢")
         return jsonify({"ok": True})
 
     if command == "/pause":
@@ -712,12 +684,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "😴 No active task found to pause.")
+            send_message(user_id, "No active task to pause. 😴")
             return jsonify({"ok": True})
         set_task_status(rows[0], "paused")
-        # EMOJI-RICH REPLY
-        send_message(user_id, "⏸️ Task paused! Use /resume to continue splitting. ▶️")
+        send_message(user_id, "Paused. Use /resume to continue. ⏸️")
         return jsonify({"ok": True})
 
     if command == "/resume":
@@ -727,12 +697,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "💤 No paused task to resume!")
+            send_message(user_id, "No paused task to resume. 🤷‍♀️")
             return jsonify({"ok": True})
         set_task_status(rows[0], "running")
-        # EMOJI-RICH REPLY
-        send_message(user_id, "▶️ Resumed! Go, go, go! 🚀")
+        send_message(user_id, "Resumed. ▶️")
         return jsonify({"ok": True})
 
     if command == "/status":
@@ -742,8 +710,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 c.execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (user_id,))
                 r = c.fetchone()
                 until = r[0] if r else "unknown"
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"⛔ Status: Suspended! ⏳ Until: {until} UTC.")
+            send_message(user_id, f"Suspended until {until} UTC. 🚫")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -754,11 +721,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if active:
             aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"Current Status: {status.upper()}! ⚙️ Remaining words: {remaining}. Queue size: {queued} 📝")
+            status_emoji = "🏃‍♂️" if status == "running" else "⏸️"
+            send_message(user_id, f"Status: {status}{status_emoji}. Remaining: {remaining}. Queue: {queued} 📝")
         else:
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"😌 No active tasks right now. Queue size: {queued} 📝")
+            send_message(user_id, f"No active tasks. Queue: {queued} 📝")
         return jsonify({"ok": True})
 
     if command == "/stop":
@@ -768,11 +734,9 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             queued = c.fetchone()[0]
         stopped = cancel_active_task_for_user(user_id)
         if stopped > 0 or queued > 0:
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"🛑 Stopped {stopped} active and cleared {queued} queued tasks! 🗑️")
+            send_message(user_id, f"Stopped {stopped} active and cleared {queued} queued tasks. 🛑")
         else:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "🤷‍♀️ No active or queued tasks to stop!")
+            send_message(user_id, "No active or queued tasks. 👍")
         return jsonify({"ok": True})
 
     if command == "/stats":
@@ -782,16 +746,16 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             c.execute("SELECT SUM(words) FROM split_logs WHERE user_id = ? AND created_at >= ?", (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
             r = c.fetchone()
             words = int(r[0] or 0) if r else 0
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"📊 Last 12 hours activity: {words} words split! ✨")
+        send_message(user_id, f"Last 12h: {words} words. 📈")
         return jsonify({"ok": True})
 
     if command == "/about":
         msg = (
-            "🤖 WordSplitter Bot Information 📖\n\n"
-            "My job is simple! I take any text you send me 📝 and split it into individual, paced word messages 💬.\n"
-            "This makes long messages easy to follow or analyze! 🧐\n\n"
-            "Admins 🧑‍💻 can manage users, suspend/resume services, and Owners 👑 can send broadcasts! 📢"
+            "🤖 WordSplitter Bot\n\n"
+            "I take any text you send and split it into individual word messages, "
+            "with controlled pacing so you can follow easily. ⏱️\n\n"
+            "Useful for breaking down long messages for readability or analysis. 🧐\n\n"
+            "Admins can manage allowed users, suspend or resume users, and owners can broadcast messages. 👑"
         )
         send_message(user_id, msg)
         return jsonify({"ok": True})
@@ -799,12 +763,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # Admin commands
     if command == "/adduser":
         if not is_admin(user_id):
-            # EMOJI-RICH REPLY
-            send_message(user_id, "👑 Only Admin users can run this command! 🙅‍♂️")
+            send_message(user_id, "Admin only. 👮")
             return jsonify({"ok": True})
         if not args:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Missing input!\nUsage: `/adduser <id>` [username]\nExample: `/adduser 12345678` ➕")
+            send_message(user_id, "Usage: /adduser <id> [username]\nExample: /adduser 12345678 👤")
             return jsonify({"ok": True})
         parts = re.split(r"[,\s]+", args.strip())
         added, already, invalid = [], [], []
@@ -826,22 +788,19 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 conn.commit()
             added.append(tid)
             try:
-                # EMOJI-RICH REPLY
-                send_message(tid, "🎉 You have been added to the bot's allowed list! Send me some text to start! 📝")
+                send_message(tid, "You were added. Send text to start. 🚀")
             except Exception:
                 pass
         parts_msgs = []
-        if added: parts_msgs.append("➕ Added: " + ", ".join(str(x) for x in added))
-        if already: parts_msgs.append("ℹ️ Already allowed: " + ", ".join(str(x) for x in already))
-        if invalid: parts_msgs.append("❌ Invalid ID: " + ", ".join(invalid))
-        # EMOJI-RICH REPLY
-        send_message(user_id, "✅ User Addition Result: \n" + ("\n".join(parts_msgs) if parts_msgs else "No changes made."))
+        if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added) + " ✅")
+        if already: parts_msgs.append("Already: " + ", ".join(str(x) for x in already) + " ℹ️")
+        if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid) + " ❌")
+        send_message(user_id, "Result: " + ("; ".join(parts_msgs) if parts_msgs else "No changes 🤷‍♂️"))
         return jsonify({"ok": True})
 
     if command == "/listusers":
         if not is_admin(user_id):
-            # EMOJI-RICH REPLY
-            send_message(user_id, "👑 Only Admin users can run this command!")
+            send_message(user_id, "Admin only. 👮")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -850,16 +809,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         lines = []
         for r in rows:
             uid, uname, isadm, added_at = r
-            lines.append(f"{uid} ({uname or 'no_uname'}) - {'👑 admin' if isadm else '👤 user'} - since {added_at} 🗓️")
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"👥 Currently Allowed Users ({len(rows)} total):\n" + ("\n".join(lines) if lines else "(none)"))
+            lines.append(f"{uid} ({uname}) - {'👑 admin' if isadm else '👤 user'} - added={added_at}")
+        send_message(user_id, "Allowed users: 👥\n" + ("\n".join(lines) if lines else "(none)"))
         return jsonify({"ok": True})
 
     # Owner-only commands
     if command == "/botinfo":
         if user_id not in OWNER_IDS:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "👑 This command is for Owners only!")
+            send_message(user_id, "Owner only. 👑")
             return jsonify({"ok": True})
         # gather info
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -883,39 +840,37 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         for r in active_rows:
             uid, uname, rem, ac = r
             name = f" ({uname})" if uname else ""
-            lines_active.append(f"{uid}{name} - {int(rem)} remaining 📝 - {int(ac)} active tasks ⚙️ - {int(get_queued_for_user(uid))} queued 🧘")
+            lines_active.append(f"👤 {uid}{name} - {int(rem)} remaining - {int(ac)} active - {int(get_queued_for_user(uid))} queued")
         lines_stats = []
         for r in stats_rows:
             uid, uname, s = r
             name = f" ({uname})" if uname else ""
-            lines_stats.append(f"{uid}{name} - {int(s)} words split 🚀")
+            lines_stats.append(f"📊 {uid}{name} - {int(s)} words")
         body = (
-            "🟢 Bot System Status (Owner Info) 👑\n"
-            f"👥 Allowed users: {total_allowed} ✅\n"
-            f"⛔ Suspended users: {total_suspended} 🚫\n"
-            f"⚙️ Active tasks (running/paused): {active_tasks} 🏃\n"
-            f"📝 Queued tasks: {queued_tasks} 🧘\n\n"
-            "👤 Users with Active Tasks: 📊\n" + ("\n".join(lines_active) if lines_active else "(_None active!_) 😴") + "\n\n"
-            "📈 User Split Stats (last 1h): ⏰\n" + ("\n".join(lines_stats) if lines_stats else "(_No splits in the last hour!_) 💤")
+            "🟢 Bot status ℹ️\n"
+            f"👥 Allowed users: {total_allowed}\n"
+            f"⛔ Suspended users: {total_suspended}\n"
+            f"⚙️ Active tasks: {active_tasks}\n"
+            f"📝 Queued tasks: {queued_tasks}\n\n"
+            "🏃 Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
+            "📈 User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
         )
         send_message(user_id, body)
         return jsonify({"ok": True})
 
     if command == "/broadcast":
         if user_id not in OWNER_IDS:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "👑 This command is for Owners only! ✋")
+            send_message(user_id, "Owner only. 👑")
             return jsonify({"ok": True})
         if not args:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Missing message! 🤷‍♀️\nUsage: `/broadcast <message>`\nExample: `/broadcast Hello everyone! 📢`")
+            send_message(user_id, "Usage: /broadcast <message>\nExample: /broadcast Hello everyone 👋")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
             c.execute("SELECT user_id FROM allowed_users")
             rows = c.fetchall()
         succeeded, failed = [], []
-        header = f"📣 Broadcast from Owner: 👑\n\n{args}"
+        header = f"📣 Broadcast from owner:\n\n{args}"
         for r in rows:
             tid = r[0]
             ok, reason = broadcast_send_raw(tid, header)
@@ -923,108 +878,96 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 succeeded.append(tid)
             else:
                 failed.append((tid, reason))
-        # EMOJI-RICH REPLY
-        summary = f"📢 Broadcast completed! 🎉 Delivered to: {len(succeeded)} users. ✅ Failed for: {len(failed)} users. ❌"
+        summary = f"Broadcast done. Delivered: {len(succeeded)} ✅. Failed: {len(failed)} ❌."
         send_message(user_id, summary)
         if failed:
-            # EMOJI-RICH REPLY
-            notify_owners("🚨 Broadcast failures detected! ❌ Users: " + ", ".join(f"{x[0]} ({x[1]})" for x in failed))
+            notify_owners("Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
         return jsonify({"ok": True})
 
     # Suspend / Unsuspend / Listsuspended
     if command == "/suspend":
         if not is_admin(user_id):
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Admin access required! 👑")
+            send_message(user_id, "❌ Admin only. 👮")
             return jsonify({"ok": True})
         if not args:
-            # EMOJI-RICH REPLY
             send_message(user_id,
-                         "❌ Missing input! 🤷‍♀️\nUsage: `/suspend <user_id> <duration> [reason]`\n"
-                         "Examples: 📝\n"
-                         "`/suspend 12345678 30s Spamming` 🛑\n"
-                         "`/suspend 9876543 5m Too many messages` 💥")
+                         "Usage: /suspend <user_id> <duration> [reason]\n"
+                         "Examples:\n"
+                         "/suspend 12345678 30s Spam 🚫\n"
+                         "/suspend 9876543 5m Too many messages 🛑")
             return jsonify({"ok": True})
         parts = args.split(None, 2)
         try:
             target = int(parts[0])
         except Exception:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Invalid user ID! 🆔\nExample: `/suspend 12345678 5m Spamming` 🛑")
+            send_message(user_id, "❌ Invalid user id.\nExample: /suspend 12345678 5m Spamming 🆔")
             return jsonify({"ok": True})
         if len(parts) < 2:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Missing duration! ⏳\nExample: `/suspend 12345678 5m Spamming` 🛑")
+            send_message(user_id, "❌ Missing duration.\nExample: /suspend 12345678 5m Spamming ⏳")
             return jsonify({"ok": True})
         dur = parts[1]
         reason = parts[2] if len(parts) > 2 else ""
         m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
         if not m:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Invalid duration format! 🕰️\nUse: `30s`, `5m`, `3h`, `2d`. 🗓️\nExample: `/suspend 12345678 5m` ⏱️")
+            send_message(user_id, "❌ Invalid duration format.\nUse 30s, 5m, 3h, 2d. 🗓️\nExample: /suspend 12345678 5m")
             return jsonify({"ok": True})
         val, unit = int(m.group(1)), (m.group(2) or "s")
         mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
         seconds = val * mul
         suspend_user(target, seconds, reason)
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"✅ Successfully suspended user {target} for {val}{unit}! ⏳")
+        send_message(user_id, f"✅ Suspended {target} for {val}{unit}. 🔒")
         return jsonify({"ok": True})
 
     if command == "/unsuspend":
         if not is_admin(user_id):
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Admin access required! 👑")
+            send_message(user_id, "❌ Admin only. 👮")
             return jsonify({"ok": True})
         if not args:
-            # EMOJI-RICH REPLY
             send_message(user_id,
-                         "❌ Missing user ID! 🤷‍♀️\nUsage: `/unsuspend <user_id>`\nExample: `/unsuspend 12345678` ✅")
+                         "Usage: /unsuspend <user_id>\n"
+                         "Example: /unsuspend 12345678 🔓")
             return jsonify({"ok": True})
         try:
             target = int(args.split()[0])
         except Exception:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Invalid user ID! 🆔\nExample: `/unsuspend 12345678` ✅")
+            send_message(user_id, "❌ Invalid user id.\nExample: /unsuspend 12345678 🆔")
             return jsonify({"ok": True})
         ok = unsuspend_user(target)
         if ok:
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"✅ User {target} has been unsuspended! 🎉")
+            send_message(user_id, f"✅ Unsuspended {target}. 🎉")
         else:
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"ℹ️ User {target} was not currently suspended. 😌")
+            send_message(user_id, f"ℹ️ User {target} was not suspended. 👍")
         return jsonify({"ok": True})
 
     if command == "/listsuspended":
         if not is_admin(user_id):
-            # EMOJI-RICH REPLY
-            send_message(user_id, "❌ Admin access required! 👑")
+            send_message(user_id, "Admin only. 👮")
             return jsonify({"ok": True})
         rows = list_suspended()
         if not rows:
-            # EMOJI-RICH REPLY
-            send_message(user_id, "🥳 No users are currently suspended! 🚫")
+            send_message(user_id, "No suspended users. 😌")
             return jsonify({"ok": True})
         lines = []
         for r in rows:
             uid, until, reason, added_at = r
-            lines.append(f"{uid} 👤 until={until} ⏳ reason={reason or '(_none_)'} 📝 added={added_at} 🗓️")
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"⛔ Currently Suspended Users ({len(rows)} total): 🚫\n" + "\n".join(lines))
+            lines.append(f"⛔ {uid} until={until} reason={reason or '(none)'} added={added_at}")
+        send_message(user_id, "Suspended: 🚫\n" + "\n".join(lines))
         return jsonify({"ok": True})
 
     # Unknown
-    # EMOJI-RICH REPLY
-    send_message(user_id, "❓ Unknown command! 🧐 Please check your input.")
+    send_message(user_id, "Unknown command. 🧐")
     return jsonify({"ok": True})
 
+def get_queued_for_user(user_id: int) -> int:
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+        return c.fetchone()[0]
 
 def handle_user_text(user_id: int, username: str, text: str):
     if not is_allowed(user_id):
-        # EMOJI-RICH REPLY
-        send_message(user_id, "❌ Sorry! You're not allowed to use this bot. 🔒 Owner (@justmemmy) has been notified. 🚨")
-        notify_owners(f"❌ Unallowed access by {user_id}. 🕵️")
+        send_message(user_id, "You are not allowed. Owner notified. 🚨")
+        notify_owners(f"Unallowed access by {user_id}. 🚫")
         return jsonify({"ok": True})
     if is_suspended(user_id):
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -1032,18 +975,15 @@ def handle_user_text(user_id: int, username: str, text: str):
             c.execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (user_id,))
             r = c.fetchone()
             until = r[0] if r else "unknown"
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"⛔ You are suspended! Service unavailable until {until} UTC. ⏳")
+        send_message(user_id, f"Suspended until {until} UTC. 🚫")
         return jsonify({"ok": True})
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
         if res["reason"] == "empty":
-            # EMOJI-RICH REPLY
-            send_message(user_id, "🚫 No words found! 🤷‍♀️ Please send longer text.")
+            send_message(user_id, "No words found. Send longer text. 📝")
             return jsonify({"ok": True})
         if res["reason"] == "queue_full":
-            # EMOJI-RICH REPLY
-            send_message(user_id, f"🈵 Your queue is full ({res['queue_size']} tasks)! 🛑 Use /stop to clear it or wait!")
+            send_message(user_id, f"Queue full ({res['queue_size']}). Use /stop. 🛑")
             return jsonify({"ok": True})
     running = None
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -1053,24 +993,22 @@ def handle_user_text(user_id: int, username: str, text: str):
         c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
         queued = c.fetchone()[0]
     if running:
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"📝 Task queued! ⏳ Position in queue: {queued}. 🧘")
+        send_message(user_id, f"Queued. Position in queue: {queued}. 📝")
     else:
-        # EMOJI-RICH REPLY
-        send_message(user_id, f"✅ Task accepted! 🎉 Will split {res['total_words']} words. 🚀")
+        send_message(user_id, f"Task accepted — will split {res['total_words']} words. 🚀")
     return jsonify({"ok": True})
 
 # Webhook setup helper
 def set_webhook():
     if not TELEGRAM_API or not WEBHOOK_URL:
-        logger.info("Webhook not configured. ❌")
+        logger.info("Webhook not configured. ℹ️")
         return
     try:
         _session.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL}, timeout=REQUESTS_TIMEOUT)
     except Exception:
-        logger.exception("set_webhook failed 🚨")
-        
-# Max container RAM for Free Tier
+        logger.exception("set_webhook failed ❌")
+
+# Check Render memory usages.
 CONTAINER_MAX_RAM_MB = 512
 
 @app.route("/mem")
