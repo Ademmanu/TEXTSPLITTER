@@ -16,9 +16,10 @@ Notes on this revision:
 - Automatically marks numeric IDs in outgoing messages as monospace (code)
   using the "entities" field, so IDs are copyable while the rest of the
   message remains plain text.
-- Adjusted user-facing replies to hide numeric IDs from regular users.
+- Removed display of task IDs everywhere in user-facing messages.
 - Usernames are displayed with an "@" prefix everywhere they are shown.
 - Owner references now include "(@justmemmy)".
+- Unauthorized user notifications to the user include their numeric ID; no other messages show user or task IDs to users.
 - Replies and notifications have more emoji for clarity.
 """
 
@@ -691,8 +692,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             est_seconds = int((total - sent) * interval)
             est_str = str(timedelta(seconds=est_seconds))
             try:
-                tid_note = f"\nTask ID: {task_id}" if user_id in OWNER_IDS else ""
-                send_message(user_id, f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}{tid_note}")
+                send_message(user_id, f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}")
             except Exception:
                 pass
             i = sent
@@ -715,16 +715,14 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                     break
                 if is_maintenance_time():
                     try:
-                        tid_note = f" (Task ID: {task_id})" if user_id in OWNER_IDS else ""
-                        send_message(user_id, f"🛠️ Your task stopped due to scheduled maintenance{tid_note}.")
+                        send_message(user_id, f"🛠️ Your task stopped due to scheduled maintenance.")
                     except Exception:
                         pass
                     set_task_status(task_id, "cancelled")
                     break
                 if status == "paused":
                     try:
-                        tid_note = f"\nTask ID: {task_id}" if user_id in OWNER_IDS else ""
-                        send_message(user_id, f"⏸️ Task paused…{tid_note}")
+                        send_message(user_id, f"⏸️ Task paused…")
                     except Exception:
                         pass
                     while True:
@@ -796,14 +794,12 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             if final_status not in ("cancelled", "paused"):
                 set_task_status(task_id, "done")
                 try:
-                    tid_note = f"\nTask ID: {task_id}" if user_id in OWNER_IDS else ""
-                    send_message(user_id, f"✅ All done!{tid_note}")
+                    send_message(user_id, f"✅ All done!")
                 except Exception:
                     pass
             elif final_status == "cancelled":
                 try:
-                    tid_note = f"\nTask ID: {task_id}" if user_id in OWNER_IDS else ""
-                    send_message(user_id, f"🛑 Task stopped.{tid_note}")
+                    send_message(user_id, f"🛑 Task stopped.")
                 except Exception:
                     pass
     except Exception:
@@ -986,7 +982,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if user_id not in OWNER_IDS and not is_allowed(user_id):
-        send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.")
+        # Only place where user's numeric ID is shown to the user per request
+        send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.\nYour ID: {user_id}")
         notify_owners(f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
         return jsonify({"ok": True})
 
@@ -1048,8 +1045,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if active:
             aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
-            tid_note = f"\nTask ID: {aid}" if user_id in OWNER_IDS else ""
-            send_message(user_id, f"ℹ️ Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}{tid_note}")
+            send_message(user_id, f"ℹ️ Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
         elif queued > 0:
             send_message(user_id, f"⏳ Waiting. Queue size: {queued}")
         else:
@@ -1288,7 +1284,8 @@ def handle_user_text(user_id: int, username: str, text: str):
         return jsonify({"ok": True})
     # Owners are always allowed; regular users must be in allowed_users
     if user_id not in OWNER_IDS and not is_allowed(user_id):
-        send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.")
+        # Only place where user's numeric ID is shown to the user per request
+        send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.\nYour ID: {user_id}")
         notify_owners(f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
         return jsonify({"ok": True})
     if is_suspended(user_id):
