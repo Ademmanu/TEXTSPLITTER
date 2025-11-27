@@ -416,6 +416,7 @@ def enqueue_task(user_id: int, username: str, text: str):
     except Exception:
         logger.exception("enqueue_task db error")
         return {"ok": False, "reason": "db_error"}
+    # Return the total words and queue size (pending + 1)
     return {"ok": True, "total_words": total, "queue_size": pending + 1}
 
 def get_next_task_for_user(user_id: int):
@@ -464,6 +465,7 @@ def record_split_log(user_id: int, username: str, count: int = 1):
         logger.exception("record_split_log error")
 
 def is_allowed(user_id: int) -> bool:
+    # Owners are always considered allowed here by caller checks, but keep DB check for regular users
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
         c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
@@ -854,9 +856,19 @@ def root():
 def health():
     return jsonify({"ok": True, "ts": now_ts()}), 200
 
+def get_user_task_counts(user_id: int):
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,))
+        active = int(c.fetchone()[0] or 0)
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+        queued = int(c.fetchone()[0] or 0)
+    return active, queued
+
 def handle_command(user_id: int, username: str, command: str, args: str):
     def is_owner(u): return u in OWNER_IDS
 
+    # Ensure /start and /about are always functional for everyone
     if command == "/start":
         msg = (
             f"👋 Hi {username or user_id}!\n"
@@ -870,11 +882,25 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, msg)
         return jsonify({"ok": True})
 
+    if command == "/about":
+        msg = (
+            "ℹ️ About:\n"
+            "I split texts into single words.\n\n"
+            "Features:\n"
+            "queueing, pause/resume, scheduled maintenance (2AM–3AM),\n"
+            "hourly owner stats, auto-delete old messages, rate-limited sending.\n\n"
+            "Developer: Owner (@justmemmy)"
+        )
+        send_message(user_id, msg)
+        return jsonify({"ok": True})
+
+    # Maintenance messages: non-owners are blocked during maintenance
     if command != "/start" and is_maintenance_time() and not is_owner(user_id):
         send_message(user_id, "🛠️ Scheduled maintenance started (2:00 AM–3:00 AM). Tasks are temporarily blocked. Please try later.")
         return jsonify({"ok": True})
 
-    if not is_allowed(user_id):
+    # Owners should always be treated as allowed even if DB missing entries.
+    if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, "❌ Sorry, you are not allowed. Owner (@justmemmy) notified.")
         notify_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
         return jsonify({"ok": True})
@@ -894,7 +920,13 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             return jsonify({"ok": True})
         start_user_worker_if_needed(user_id)
         notify_user_worker(user_id)
-        send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
+        # Compute whether there's an active task; if so, show queue position
+        active, queued = get_user_task_counts(user_id)
+        if active:
+            # queued contains the number of queued tasks including this one
+            send_message(user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
+        else:
+            send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
         return jsonify({"ok": True})
 
     if command == "/pause":
@@ -956,18 +988,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     if command == "/stats":
         words = compute_last_12h_stats(user_id)
         send_message(user_id, f"🕰️ Your last 12 hours: {words} words split")
-        return jsonify({"ok": True})
-
-    if command == "/about":
-        msg = (
-            "ℹ️ About:\n"
-            "I split texts into single words.\n\n"
-            "Features:\n"
-            "queueing, pause/resume, scheduled maintenance (2AM–3AM),\n"
-            "hourly owner stats, auto-delete old messages, rate-limited sending.\n\n"
-            "Developer: Owner (@justmemmy)"
-        )
-        send_message(user_id, msg)
         return jsonify({"ok": True})
 
     if command == "/adduser":
@@ -1183,7 +1203,8 @@ def handle_user_text(user_id: int, username: str, text: str):
     if is_maintenance_time():
         send_message(user_id, "🛠️ Scheduled maintenance started (2:00 AM–3:00 AM). Tasks are temporarily blocked. Please try later.")
         return jsonify({"ok": True})
-    if not is_allowed(user_id):
+    # Owners are always allowed; regular users must be in allowed_users
+    if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, "❌ Sorry, you are not allowed. Owner (@justmemmy) notified.")
         notify_owners(f"⚠️ Unallowed access attempt by {user_id}.")
         return jsonify({"ok": True})
@@ -1211,14 +1232,10 @@ def handle_user_text(user_id: int, username: str, text: str):
         return jsonify({"ok": True})
     start_user_worker_if_needed(user_id)
     notify_user_worker(user_id)
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,))
-        running = c.fetchone()
-        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
-        queued = c.fetchone()[0]
-    if running:
-        send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
+    # Compute whether there is an active task; if so, show queue position
+    active, queued = get_user_task_counts(user_id)
+    if active:
+        send_message(user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
     else:
         send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
     return jsonify({"ok": True})
