@@ -14,8 +14,10 @@ Features:
 Notes on this revision:
 - Removed all message text styling (no parse_mode is sent).
 - Automatically marks numeric IDs in outgoing messages as monospace (code)
-  using the "entities" field, so IDs are copyable while the rest of the
+  using the "entities" field so IDs are copyable while the rest of the
   message remains plain text.
+- Adds "mention" entities for @usernames so they become clickable in Telegram.
+  (We add entities of type "mention" for ASCII @username tokens up to 32 chars.)
 - Removed display of task IDs everywhere in user-facing messages.
 - Usernames are displayed with an "@" prefix everywhere they are shown.
 - Owner references now include "(@justmemmy)".
@@ -309,12 +311,49 @@ def parse_telegram_json(resp):
     except Exception:
         return None
 
+def _build_entities_for_text(text: str):
+    """
+    Build a list of Telegram message entities for:
+    - plain numeric tokens -> type "code" (same as before)
+    - @username tokens -> type "mention" so they become clickable in Telegram
+
+    We scan for mentions first, then numbers, avoiding overlapping spans.
+    Offsets/lengths use UTF-16 code units; for ASCII characters this matches Python indices.
+    """
+    if not text:
+        return None
+    entities = []
+    used_spans = []
+
+    # Find @username mentions (ASCII, 1..32 chars: letters, numbers, underscore)
+    for m in re.finditer(r"@([A-Za-z0-9_]{1,32})", text):
+        start = m.start()
+        length = m.end() - m.start()
+        entities.append({"type": "mention", "offset": start, "length": length})
+        used_spans.append((start, start + length))
+
+    # Find numeric tokens that do not overlap existing mention spans
+    for m in re.finditer(r"\b\d+\b", text):
+        start = m.start()
+        end = m.end()
+        # check overlap
+        overlap = False
+        for s, e in used_spans:
+            if not (end <= s or start >= e):
+                overlap = True
+                break
+        if overlap:
+            continue
+        length = end - start
+        entities.append({"type": "code", "offset": start, "length": length})
+        used_spans.append((start, end))
+
+    return entities if entities else None
+
 def _build_code_entities_for_numbers(text: str):
     """
-    Find plain numeric tokens (sequences of digits) and return a list of
-    message entity dicts marking them as type 'code'. Offsets/lengths use
-    UTF-16 code units as required by Telegram; for ASCII digits this is
-    equivalent to Python string indices, so this is safe here.
+    Legacy helper: mark numeric tokens as code. Kept for backward compatibility
+    but send_message now uses _build_entities_for_text instead.
     """
     entities = []
     for m in re.finditer(r"\b\d+\b", text):
@@ -370,15 +409,15 @@ def reset_failures(user_id: int):
 
 def send_message(chat_id: int, text: str):
     """
-    Send plain text (no parse_mode). Numeric IDs inside the text are sent
-    as monospace (code) via the 'entities' parameter so they are copyable.
+    Send plain text (no parse_mode). Numeric IDs and @usernames inside the text are
+    marked as message entities (code and mention respectively) so they are copyable/clickable.
     """
     if not TELEGRAM_API:
         logger.error("No TELEGRAM_TOKEN; cannot send message.")
         return None
     acquire_token(timeout=5.0)
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    entities = _build_code_entities_for_numbers(text)
+    entities = _build_entities_for_text(text)
     if entities:
         payload["entities"] = entities
     try:
@@ -406,12 +445,12 @@ def send_message(chat_id: int, text: str):
 
 def broadcast_send_raw(chat_id: int, text: str):
     """
-    Send a plain broadcast message; numeric IDs will be marked monospace (code).
+    Send a plain broadcast message; numeric IDs and @usernames will be marked via entities.
     """
     if not TELEGRAM_API:
         return False, "no_token"
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    entities = _build_code_entities_for_numbers(text)
+    entities = _build_entities_for_text(text)
     if entities:
         payload["entities"] = entities
     try:
