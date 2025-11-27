@@ -273,37 +273,25 @@ def parse_telegram_json(resp):
     except Exception:
         return None
 
-def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
-    if not TELEGRAM_API:
-        logger.error("No TELEGRAM_TOKEN; cannot send message.")
-        return None
-    acquire_token(timeout=5.0)
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
-    try:
-        resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
-    except Exception:
-        logger.exception("Network send error")
-        increment_failure(chat_id)
-        return None
-    data = parse_telegram_json(resp)
-    if data and data.get("ok"):
-        try:
-            mid = data["result"].get("message_id")
-            if mid:
-                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",(chat_id, mid, now_ts()))
-                    conn.commit()
-        except Exception:
-            logger.exception("record sent message failed")
-        reset_failures(chat_id)
-        return data["result"]
-    else:
-        increment_failure(chat_id)
-        return None
-
 def increment_failure(user_id: int):
     try:
+        # If owner failing, log but avoid notifying owners or cancelling their tasks to prevent recursion/loops.
+        if user_id in OWNER_IDS:
+            logger.warning("Send failure for owner %s; recording but not notifying owners to avoid recursion.", user_id)
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute("SELECT failures FROM send_failures WHERE user_id = ?", (user_id,))
+                row = c.fetchone()
+                if not row:
+                    c.execute("INSERT INTO send_failures (user_id, failures, last_failure_at) VALUES (?, ?, ?)",
+                              (user_id, 1, now_ts()))
+                else:
+                    failures = int(row[0] or 0) + 1
+                    c.execute("UPDATE send_failures SET failures = ?, last_failure_at = ? WHERE user_id = ?",
+                              (failures, now_ts(), user_id))
+                conn.commit()
+            return
+
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
             c.execute("SELECT failures FROM send_failures WHERE user_id = ?", (user_id,))
@@ -329,6 +317,62 @@ def reset_failures(user_id: int):
             conn.commit()
     except Exception:
         pass
+
+def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
+    if not TELEGRAM_API:
+        logger.error("No TELEGRAM_TOKEN; cannot send message.")
+        return None
+    acquire_token(timeout=5.0)
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+    try:
+        resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
+    except Exception:
+        logger.exception("Network send error")
+        increment_failure(chat_id)
+        return None
+    data = parse_telegram_json(resp)
+    # If Telegram rejects due to parse/entity issues, retry once without parse_mode
+    if data and not data.get("ok"):
+        desc = data.get("description", "") if isinstance(data, dict) else ""
+        if "parse" in desc.lower() or "entities" in desc.lower():
+            logger.info("Telegram parse/entities error for chat %s: %s. Retrying without parse_mode.", chat_id, desc)
+            try:
+                resp2 = _session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=REQUESTS_TIMEOUT)
+                data2 = parse_telegram_json(resp2)
+                if data2 and data2.get("ok"):
+                    try:
+                        mid = data2["result"].get("message_id")
+                        if mid:
+                            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                                c = conn.cursor()
+                                c.execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",(chat_id, mid, now_ts()))
+                                conn.commit()
+                    except Exception:
+                        logger.exception("record sent message failed (retry)")
+                    reset_failures(chat_id)
+                    return data2["result"]
+            except Exception:
+                logger.exception("Retry send (no parse_mode) network error")
+                increment_failure(chat_id)
+                return None
+        increment_failure(chat_id)
+        return None
+
+    if data and data.get("ok"):
+        try:
+            mid = data["result"].get("message_id")
+            if mid:
+                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    c = conn.cursor()
+                    c.execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",(chat_id, mid, now_ts()))
+                    conn.commit()
+        except Exception:
+            logger.exception("record sent message failed")
+        reset_failures(chat_id)
+        return data["result"]
+    else:
+        increment_failure(chat_id)
+        return None
 
 def broadcast_send_raw(chat_id: int, text: str):
     if not TELEGRAM_API:
@@ -465,7 +509,9 @@ def record_split_log(user_id: int, username: str, count: int = 1):
         logger.exception("record_split_log error")
 
 def is_allowed(user_id: int) -> bool:
-    # Owners are always considered allowed here by caller checks, but keep DB check for regular users
+    # Owners are always allowed
+    if user_id in OWNER_IDS:
+        return True
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
         c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
@@ -827,22 +873,24 @@ def webhook():
             uid = user.get("id")
             username = user.get("username") or (user.get("first_name") or "")
             text = msg.get("text") or ""
+
+            # Ensure an allowed_users row exists for this user (insert if missing), then update username
+            try:
+                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    c = conn.cursor()
+                    c.execute("INSERT OR IGNORE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)",
+                              (uid, username or "", now_ts()))
+                    c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username or "", uid))
+                    conn.commit()
+            except Exception:
+                logger.exception("webhook: ensure allowed_users row failed")
+
             if text.startswith("/"):
                 parts = text.split(None, 1)
                 cmd = parts[0].split("@")[0].lower()
                 args = parts[1] if len(parts) > 1 else ""
-                # Save/refresh username in allowed_users table:
-                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username, uid))
-                    conn.commit()
                 return handle_command(uid, username, cmd, args)
             else:
-                # Save/refresh username in allowed_users table:
-                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username, uid))
-                    conn.commit()
                 return handle_user_text(uid, username, text)
     except Exception:
         logger.exception("webhook handling error")
@@ -894,12 +942,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, msg)
         return jsonify({"ok": True})
 
-    # Maintenance messages: non-owners are blocked during maintenance
     if command != "/start" and is_maintenance_time() and not is_owner(user_id):
         send_message(user_id, "🛠️ Scheduled maintenance started (2:00 AM–3:00 AM). Tasks are temporarily blocked. Please try later.")
         return jsonify({"ok": True})
 
-    # Owners should always be treated as allowed even if DB missing entries.
     if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, "❌ Sorry, you are not allowed. Owner (@justmemmy) notified.")
         notify_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
@@ -920,10 +966,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             return jsonify({"ok": True})
         start_user_worker_if_needed(user_id)
         notify_user_worker(user_id)
-        # Compute whether there's an active task; if so, show queue position
         active, queued = get_user_task_counts(user_id)
         if active:
-            # queued contains the number of queued tasks including this one
             send_message(user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
         else:
             send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
