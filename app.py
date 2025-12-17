@@ -1432,7 +1432,7 @@ def webhook():
                     }, timeout=2)
                 except Exception:
                     pass
-                return jsonify({"ok": True}")
+                return jsonify({"ok": True})
             
             # Answer callback query to remove loading state
             try:
