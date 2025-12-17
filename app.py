@@ -1208,8 +1208,8 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "✨ Owner operation cancelled! Use /ownersets to start again.",
-                    "reply_markup": create_ownersets_keyboard()
+                    "text": "✨ Operation cancelled!\n\nUse /ownersets to access the menu again.",
+                    "parse_mode": "Markdown"
                 }, timeout=3)
                 return jsonify({"ok": True})
             
@@ -1222,7 +1222,7 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "👤 *Add User*\n\nPlease send me the User ID you'd like to add.\nYou can also include a username after the ID if you want!",
+                    "text": "👤 *Add User*\n\nPlease send me the User ID you'd like to add:\n\n_You can send multiple IDs separated by spaces or commas._",
                     "parse_mode": "Markdown",
                     "reply_markup": create_cancel_keyboard()
                 }, timeout=3)
@@ -1242,13 +1242,18 @@ def webhook():
                     uname_s = f"({at_username(uname)})" if uname else "(no username)"
                     added_at_wat = utc_to_wat_ts(added_at_utc)
                     lines.append(f"{uid} {uname_s} added={added_at_wat}")
-                response_text = "👥 *Allowed users:*\n\n" + ("\n".join(lines) if lines else "(none)")
+                
+                response_text = "👥 *Allowed Users*\n\n" + ("\n".join(lines) if lines else "No users found.")
+                if len(response_text) > 4000:
+                    response_text = "👥 *Allowed Users*\n\n" + ("\n".join(lines[:15]) if lines else "No users found.")
+                    if len(lines) > 15:
+                        response_text += f"\n\n... and {len(lines) - 15} more users"
+                
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": response_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": create_ownersets_keyboard()
+                    "parse_mode": "Markdown"
                 }, timeout=3)
                 
             elif operation == "list_suspended":
@@ -1263,7 +1268,7 @@ def webhook():
                         unsuspend_user(uid)
                 rows = list_suspended()
                 if not rows:
-                    response_text = "✅ *No suspended users!*"
+                    response_text = "✅ *No Suspended Users*"
                 else:
                     lines = []
                     for r in rows:
@@ -1272,14 +1277,18 @@ def webhook():
                         added_wat = utc_to_wat_ts(added_at_utc)
                         uname = fetch_display_username(uid)
                         uname_s = f"({at_username(uname)})" if uname else ""
-                        lines.append(f"{uid} {uname_s} until={until_wat} reason={reason}")
-                    response_text = "🚫 *Suspended users:*\n\n" + "\n".join(lines)
+                        lines.append(f"{uid} {uname_s}\nUntil: {until_wat}\nReason: {reason}\n")
+                    response_text = "🚫 *Suspended Users*\n\n" + "\n".join(lines)
+                    if len(response_text) > 4000:
+                        response_text = "🚫 *Suspended Users*\n\n" + "\n".join(lines[:10])
+                        if len(lines) > 10:
+                            response_text += f"\n\n... and {len(lines) - 10} more"
+                
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": response_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": create_ownersets_keyboard()
+                    "parse_mode": "Markdown"
                 }, timeout=3)
                 
             elif operation == "bot_info":
@@ -1322,20 +1331,22 @@ def webhook():
                     c.execute("SELECT COUNT(*) FROM suspended_users")
                     total_suspended = c.fetchone()[0]
                 response_text = (
-                    f"🤖 *Bot Status: Online*\n\n"
+                    f"🤖 *Bot Status*\n\n"
                     f"👥 Allowed users: {total_allowed}\n"
                     f"🚫 Suspended users: {total_suspended}\n"
                     f"⚙️ Active tasks: {len(active_rows)}\n"
-                    f"📨 Queued tasks: {queued_tasks}\n\n"
-                    "*Users with active tasks:*\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
-                    "*User stats (last 1h):*\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
+                    f"📨 Queued tasks: {queued_tasks}\n"
                 )
+                if lines_active:
+                    response_text += f"\n*Active Tasks:*\n" + "\n".join(lines_active)
+                if lines_stats:
+                    response_text += f"\n\n*Last Hour Stats:*\n" + "\n".join(lines_stats)
+                
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": response_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": create_ownersets_keyboard()
+                    "parse_mode": "Markdown"
                 }, timeout=3)
                 
             elif operation == "broadcast":
@@ -1346,7 +1357,7 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "📣 *Broadcast Message*\n\nPlease send me the message you'd like to broadcast to all allowed users:",
+                    "text": "📣 *Broadcast Message*\n\nPlease send me the message you'd like to broadcast:",
                     "parse_mode": "Markdown",
                     "reply_markup": create_cancel_keyboard()
                 }, timeout=3)
@@ -1359,7 +1370,7 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "⏸️ *Suspend User*\n\nPlease send me:\n\n`<user_id> <duration> [reason]`\n\n*Examples:*\n`8282747479 30s Too many requests`\n`123456 2h Spam`\n`789012 1d Violation`",
+                    "text": "⏸️ *Suspend User*\n\nPlease send:\n\n`<user_id> <duration> [reason]`\n\n*Examples:*\n`8282747479 30s Too many requests`\n`123456 2h Spam`",
                     "parse_mode": "Markdown",
                     "reply_markup": create_cancel_keyboard()
                 }, timeout=3)
@@ -1372,7 +1383,7 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "▶️ *Unsuspend User*\n\nPlease send me the User ID you'd like to unsuspend:",
+                    "text": "▶️ *Unsuspend User*\n\nPlease send the User ID to unsuspend:",
                     "parse_mode": "Markdown",
                     "reply_markup": create_cancel_keyboard()
                 }, timeout=3)
@@ -1385,7 +1396,7 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "🔍 *Check User Preview*\n\nLet's check a user's recent tasks! 📝\n\n*Step 1 of 2:* Please send me the User ID:",
+                    "text": "🔍 *Check User Preview*\n\nStep 1/2: Please send the User ID:",
                     "parse_mode": "Markdown",
                     "reply_markup": create_cancel_keyboard()
                 }, timeout=3)
@@ -1430,6 +1441,10 @@ def webhook():
                 args = parts[1] if len(parts) > 1 else ""
                 return handle_command(uid, username, cmd, args)
             else:
+                # Block owners from submitting tasks while in /ownersets workflow
+                if uid in OWNER_IDS and get_owner_state(uid):
+                    send_message(uid, "⚠️ Please complete or cancel your current owner operation first.\nUse /ownersets to access the menu.")
+                    return jsonify({"ok": True})
                 return handle_user_text(uid, username, text)
     except Exception:
         logger.exception("webhook handling error")
@@ -1487,13 +1502,20 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                 except Exception:
                     pass
             
-            parts_msgs = []
-            if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added))
-            if already: parts_msgs.append("Already present: " + ", ".join(str(x) for x in already))
-            if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid))
+            # Build result message
+            result_parts = []
+            if added:
+                result_parts.append(f"✅ Added: {', '.join(str(x) for x in added)}")
+            if already:
+                result_parts.append(f"ℹ️ Already present: {', '.join(str(x) for x in already)}")
+            if invalid:
+                result_parts.append(f"❌ Invalid: {', '.join(invalid)}")
             
-            response_text = "✅ *Add User Results:*\n\n" + ("; ".join(parts_msgs) if parts_msgs else "No changes")
-            send_message(user_id, response_text, reply_markup=create_ownersets_keyboard())
+            result_message = "👤 *Add User Results*\n\n" + "\n".join(result_parts)
+            result_message += "\n\nUse /ownersets to access the menu again."
+            
+            # Send single clear message
+            send_message(user_id, result_message)
             clear_owner_state(user_id)
             
     elif operation == "broadcast":
@@ -1504,7 +1526,7 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                 c.execute("SELECT user_id FROM allowed_users")
                 rows = c.fetchall()
             succeeded, failed = [], []
-            header = f"📣 *Broadcast from {OWNER_TAG}:*\n\n{text}"
+            header = f"📣 Broadcast from {OWNER_TAG}:\n\n{text}"
             for r in rows:
                 tid = r[0]
                 ok, reason = broadcast_send_raw(tid, header)
@@ -1512,10 +1534,19 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                     succeeded.append(tid)
                 else:
                     failed.append((tid, reason))
-            summary = f"📨 *Broadcast Complete!*\n\n✅ Success: {len(succeeded)}\n❌ Failed: {len(failed)}"
-            send_message(user_id, summary, reply_markup=create_ownersets_keyboard())
+            
+            # Build result message
+            result_message = f"📣 *Broadcast Complete*\n\n✅ Success: {len(succeeded)}\n❌ Failed: {len(failed)}"
             if failed:
-                notify_owners("⚠️ Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
+                failed_summary = ", ".join([f"{uid}({reason[:20]})" for uid, reason in failed[:5]])
+                if len(failed) > 5:
+                    failed_summary += f" and {len(failed)-5} more"
+                result_message += f"\n\nFailed IDs: {failed_summary}"
+            
+            result_message += "\n\nUse /ownersets to access the menu again."
+            
+            # Send single clear message
+            send_message(user_id, result_message)
             clear_owner_state(user_id)
             
     elif operation == "suspend":
@@ -1524,27 +1555,32 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
             try:
                 target = int(parts[0])
             except Exception:
-                send_message(user_id, "❌ *Invalid user id.* Please try again:", reply_markup=create_cancel_keyboard())
+                send_message(user_id, "❌ *Invalid User ID*\n\nPlease send a valid numeric User ID:")
                 return jsonify({"ok": True})
             
             if len(parts) < 2:
-                send_message(user_id, "❌ *Missing duration.* Please try again:", reply_markup=create_cancel_keyboard())
+                send_message(user_id, "❌ *Missing Duration*\n\nPlease include duration (e.g., 30s, 10m, 2h):")
                 return jsonify({"ok": True})
             
             dur = parts[1]
             reason = " ".join(parts[2:]) if len(parts) > 2 else ""
             m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
             if not m:
-                send_message(user_id, "❌ *Invalid duration format.* Examples: 30s 10m 2h 1d", reply_markup=create_cancel_keyboard())
-                return jsonify({"ok": True})
+                send_message(user_id, "❌ *Invalid Duration*\n\nExamples: 30s, 10m, 2h, 1d")
+                return jsonify({"ok": True}")
             
             val, unit = int(m.group(1)), (m.group(2) or "s")
             mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
             seconds = val * mul
             suspend_user(target, seconds, reason)
-            reason_part = f"\nReason: {reason}" if reason else ""
+            
             until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
-            send_message(user_id, f"🔒 *User Suspended!*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}\nUntil: {until_wat}{reason_part}", reply_markup=create_ownersets_keyboard())
+            reason_part = f"\nReason: {reason}" if reason else ""
+            
+            result_message = f"🔒 *User Suspended*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}\nUntil: {until_wat}{reason_part}"
+            result_message += "\n\nUse /ownersets to access the menu again."
+            
+            send_message(user_id, result_message)
             clear_owner_state(user_id)
             
     elif operation == "unsuspend":
@@ -1552,14 +1588,17 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
             try:
                 target = int(text.split()[0])
             except Exception:
-                send_message(user_id, "❌ *Invalid user id.* Please try again:", reply_markup=create_cancel_keyboard())
+                send_message(user_id, "❌ *Invalid User ID*\n\nPlease send a valid numeric User ID:")
                 return jsonify({"ok": True})
             
             ok = unsuspend_user(target)
             if ok:
-                send_message(user_id, f"✅ *User Unsuspended!*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}", reply_markup=create_ownersets_keyboard())
+                result_message = f"✅ *User Unsuspended*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}"
             else:
-                send_message(user_id, f"ℹ️ *User Not Suspended*\n\nUser {target} is not currently suspended.", reply_markup=create_ownersets_keyboard())
+                result_message = f"ℹ️ *User Not Suspended*\n\nUser {target} is not currently suspended."
+            
+            result_message += "\n\nUse /ownersets to access the menu again."
+            send_message(user_id, result_message)
             clear_owner_state(user_id)
             
     elif operation == "check_preview":
@@ -1569,33 +1608,34 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                 target_user = int(text.strip())
                 data["user_id"] = target_user
                 set_owner_state(user_id, "check_preview", 2, data)
-                send_message(user_id, "🔍 *Check User Preview*\n\nGreat! Now *Step 2 of 2:* How many hours back should I check? (e.g., 1, 6, 12, 24)", reply_markup=create_cancel_keyboard())
+                send_message(user_id, "🔍 *Check User Preview*\n\nStep 2/2: How many hours back should I check? (1-720):")
             except ValueError:
-                send_message(user_id, "❌ *Invalid User ID.* Please send a valid numeric User ID:", reply_markup=create_cancel_keyboard())
+                send_message(user_id, "❌ *Invalid User ID*\n\nPlease send a valid numeric User ID:")
         elif step == 2:
             # Step 2: Get hours and show preview
             try:
                 hours = int(text.strip())
-                if hours <= 0 or hours > 720:  # Max 30 days
-                    send_message(user_id, "❌ *Invalid hours.* Please choose between 1 and 720 hours (30 days):", reply_markup=create_cancel_keyboard())
+                if hours <= 0 or hours > 720:
+                    send_message(user_id, "❌ *Invalid Hours*\n\nPlease choose between 1 and 720 hours (30 days):")
                     return jsonify({"ok": True})
                 
                 target_user = data["user_id"]
                 previews = get_user_task_previews(target_user, hours)
                 
                 if not previews:
-                    response_text = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nHours: {hours}\n\nNo tasks found in the last {hours} hour(s). 📭"
+                    result_message = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nHours: {hours}\n\nNo tasks found in the last {hours} hour(s)."
                 else:
-                    preview_text = "\n".join(previews[:20])  # Limit to 20 tasks
+                    preview_text = "\n".join(previews[:20])
                     if len(previews) > 20:
                         preview_text += f"\n\n... and {len(previews) - 20} more tasks"
-                    response_text = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nHours: {hours}\n\n*First two words of each task:*\n\n{preview_text}"
+                    result_message = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nHours: {hours}\n\nFirst two words of each task:\n\n{preview_text}"
                 
-                send_message(user_id, response_text, reply_markup=create_ownersets_keyboard())
+                result_message += "\n\nUse /ownersets to access the menu again."
+                send_message(user_id, result_message)
                 clear_owner_state(user_id)
                 
             except ValueError:
-                send_message(user_id, "❌ *Invalid hours.* Please send a valid number:", reply_markup=create_cancel_keyboard())
+                send_message(user_id, "❌ *Invalid Hours*\n\nPlease send a valid number (1-720):")
     
     return jsonify({"ok": True})
 
@@ -1718,14 +1758,19 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             return jsonify({"ok": True})
         # Clear any existing state
         clear_owner_state(user_id)
-        # Send owner control panel
-        send_message(user_id, "👑 *Owner Control Panel*\n\nSelect an operation below:", reply_markup=create_ownersets_keyboard())
+        # Send owner control panel with compact message
+        send_message(user_id, "👑 *Owner Menu*", reply_markup=create_ownersets_keyboard())
         return jsonify({"ok": True})
 
     send_message(user_id, "❓ Unknown command.")
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
+    # Block owners from submitting tasks while in /ownersets workflow
+    if user_id in OWNER_IDS and get_owner_state(user_id):
+        send_message(user_id, "⚠️ Please complete or cancel your current owner operation first.\nUse /ownersets to access the menu.")
+        return jsonify({"ok": True})
+    
     if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.\nYour ID: {user_id}")
         notify_owners(f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
