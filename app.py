@@ -9,11 +9,14 @@ import logging
 import re
 import signal
 import math
+import ssl
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
 import requests
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -36,15 +39,58 @@ PERMANENT_SUSPEND_DAYS = int(os.environ.get("PERMANENT_SUSPEND_DAYS", "365"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else None
 
-# Configure requests session with larger connection pool
+# Configure requests session with better SSL handling and retry logic
 _session = requests.Session()
+
+# Custom SSL context to handle various SSL issues
 try:
-    from requests.adapters import HTTPAdapter
-    adapter = HTTPAdapter(pool_connections=MAX_CONCURRENT_WORKERS*2, pool_maxsize=max(20, MAX_CONCURRENT_WORKERS*2))
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    # Create a custom SSL context that's more tolerant
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    # Configure retry strategy for network/SSL errors
+    retry_strategy = Retry(
+        total=5,  # Total number of retries
+        backoff_factor=1,  # Wait 1, 2, 4, 8, 16 seconds between retries
+        status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
+        allowed_methods=["POST", "GET"]  # Only retry on POST and GET
+    )
+    
+    # Create adapter with retry strategy
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=MAX_CONCURRENT_WORKERS*2,
+        pool_maxsize=max(20, MAX_CONCURRENT_WORKERS*2),
+        pool_block=False
+    )
+    
     _session.mount("https://", adapter)
     _session.mount("http://", adapter)
-except Exception:
-    pass
+    
+    # Update session to use our custom SSL context
+    _session.verify = False  # Disable SSL verification (use with caution)
+    
+    # Also set some default headers
+    _session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (compatible; WordSplitterBot/1.0)',
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive'
+    })
+    
+except Exception as e:
+    logger.warning("Could not configure advanced session settings: %s", e)
+    # Fall back to basic configuration
+    try:
+        adapter = HTTPAdapter(pool_connections=MAX_CONCURRENT_WORKERS*2, pool_maxsize=max(20, MAX_CONCURRENT_WORKERS*2))
+        _session.mount("https://", adapter)
+        _session.mount("http://", adapter)
+    except Exception:
+        pass
 
 def parse_id_list(raw: str) -> List[int]:
     if not raw:
@@ -94,7 +140,7 @@ def label_for_owner_view(target_id: int, target_username: str) -> str:
 
 OWNER_TAG = "Owner (@justmemmy)"
 
-_db_lock = threading.RLock()  # Changed to RLock for nested locking
+_db_lock = threading.RLock()
 GLOBAL_DB_CONN: sqlite3.Connection = None
 
 def _ensure_db_parent(dirpath: str):
@@ -135,7 +181,8 @@ def init_db():
             created_at TEXT,
             started_at TEXT,
             finished_at TEXT,
-            last_activity TEXT
+            last_activity TEXT,
+            retry_count INTEGER DEFAULT 0
         )""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS split_logs (
@@ -328,6 +375,18 @@ def _build_entities_for_text(text: str):
         entities.append({"type": "code", "offset": utf16_offset, "length": utf16_length})
     return entities if entities else None
 
+def is_ssl_error(exception) -> bool:
+    """Check if exception is an SSL error"""
+    error_str = str(exception).lower()
+    ssl_keywords = ['ssl', 'tls', 'decryption', 'cipher', 'handshake', 'certificate', 'mac']
+    return any(keyword in error_str for keyword in ssl_keywords)
+
+def is_network_error(exception) -> bool:
+    """Check if exception is a network error"""
+    error_str = str(exception).lower()
+    network_keywords = ['connection', 'timeout', 'reset', 'refused', 'unreachable']
+    return any(keyword in error_str for keyword in network_keywords)
+
 # Failure handling helpers
 
 def is_permanent_telegram_error(code: int, description: str = "") -> bool:
@@ -458,10 +517,37 @@ def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None):
     max_attempts = 3
     attempt = 0
     backoff_base = 0.5
+    
     while attempt < max_attempts:
         attempt += 1
         try:
             resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
+        except requests.exceptions.SSLError as e:
+            logger.warning("SSL send error to %s (attempt %s): %s", chat_id, attempt, e)
+            # SSL errors are usually transient - wait longer and retry
+            if attempt >= max_attempts:
+                # Don't record this as a permanent failure - it's a network issue
+                logger.error("SSL error persists for %s after %s attempts", chat_id, max_attempts)
+                return None
+            # Wait longer for SSL errors
+            time.sleep(backoff_base * (4 ** (attempt - 1)))  # Longer backoff for SSL errors
+            continue
+        except requests.exceptions.ConnectionError as e:
+            logger.warning("Connection send error to %s (attempt %s): %s", chat_id, attempt, e)
+            # Connection errors are usually transient
+            if attempt >= max_attempts:
+                record_failure(chat_id, inc=1, description=f"connection_error: {str(e)}")
+                return None
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
+            continue
+        except requests.exceptions.Timeout as e:
+            logger.warning("Timeout send error to %s (attempt %s): %s", chat_id, attempt, e)
+            # Timeout errors are usually transient
+            if attempt >= max_attempts:
+                record_failure(chat_id, inc=1, description=f"timeout: {str(e)}")
+                return None
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
+            continue
         except requests.exceptions.RequestException as e:
             logger.warning("Network send error to %s (attempt %s): %s", chat_id, attempt, e)
             # transient network error: retry with backoff
@@ -606,8 +692,8 @@ def enqueue_task(user_id: int, username: str, text: str):
         if pending >= MAX_QUEUE_PER_USER:
             return {"ok": False, "reason": "queue_full", "queue_size": pending}
         try:
-            c.execute("INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at, sent_count, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                      (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0, now_ts()))
+            c.execute("INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at, sent_count, last_activity, retry_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0, now_ts(), 0))
             GLOBAL_DB_CONN.commit()
         except Exception:
             logger.exception("enqueue_task db error")
@@ -617,11 +703,11 @@ def enqueue_task(user_id: int, username: str, text: str):
 def get_next_task_for_user(user_id: int):
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
-        c.execute("SELECT id, words_json, total_words, text FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
+        c.execute("SELECT id, words_json, total_words, text, retry_count FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
         r = c.fetchone()
     if not r:
         return None
-    return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), "total_words": r[2], "text": r[3]}
+    return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), "total_words": r[2], "text": r[3], "retry_count": r[4]}
 
 def set_task_status(task_id: int, status: str):
     with _db_lock:
@@ -639,6 +725,13 @@ def update_task_activity(task_id: int):
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
         c.execute("UPDATE tasks SET last_activity = ? WHERE id = ?", (now_ts(), task_id))
+        GLOBAL_DB_CONN.commit()
+
+def increment_task_retry(task_id: int):
+    """Increment the retry count for a task"""
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("UPDATE tasks SET retry_count = retry_count + 1, last_activity = ? WHERE id = ?", (now_ts(), task_id))
         GLOBAL_DB_CONN.commit()
 
 def cancel_active_task_for_user(user_id: int):
@@ -783,19 +876,30 @@ def stop_user_worker(user_id: int, join_timeout: float = 0.5):
             logger.info("Stopped worker for user %s", user_id)
 
 def check_stuck_tasks():
-    """Check for tasks that haven't had activity in over 5 minutes and mark them as stuck"""
+    """Check for tasks that haven't had activity in over 2 minutes and mark them as stuck"""
     try:
-        cutoff = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (datetime.utcnow() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
         with _db_lock:
             c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT id, user_id, status FROM tasks WHERE status IN ('running', 'paused') AND last_activity < ?", (cutoff,))
+            c.execute("SELECT id, user_id, status, retry_count FROM tasks WHERE status IN ('running', 'paused') AND last_activity < ?", (cutoff,))
             stuck_tasks = c.fetchall()
             
-            for task_id, user_id, status in stuck_tasks:
-                logger.warning(f"Stuck task detected: task_id={task_id}, user_id={user_id}, status={status}")
-                # Mark as cancelled and restart worker
-                c.execute("UPDATE tasks SET status = 'cancelled', finished_at = ? WHERE id = ?", (now_ts(), task_id))
-                notify_user_worker(user_id)
+            for task_id, user_id, status, retry_count in stuck_tasks:
+                logger.warning(f"Stuck task detected: task_id={task_id}, user_id={user_id}, status={status}, retry_count={retry_count}")
+                
+                if retry_count < 3:  # Allow up to 3 retries
+                    # Reset task to queued for retry
+                    c.execute("UPDATE tasks SET status = 'queued', retry_count = retry_count + 1, last_activity = ? WHERE id = ?", (now_ts(), task_id))
+                    logger.info(f"Reset stuck task {task_id} to queued (retry {retry_count + 1})")
+                    notify_user_worker(user_id)
+                else:
+                    # Too many retries, mark as cancelled
+                    c.execute("UPDATE tasks SET status = 'cancelled', finished_at = ? WHERE id = ?", (now_ts(), task_id))
+                    logger.info(f"Cancelled stuck task {task_id} after {retry_count} retries")
+                    try:
+                        send_message(user_id, f"🛑 Your task was cancelled after multiple failures. Please try again.")
+                    except Exception:
+                        pass
             
             if stuck_tasks:
                 GLOBAL_DB_CONN.commit()
@@ -829,6 +933,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             task_id = task["id"]
             words = task["words"]
             total = int(task["total_words"] or len(words))
+            retry_count = task.get("retry_count", 0)
 
             with _db_lock:
                 c = GLOBAL_DB_CONN.cursor()
@@ -869,6 +974,13 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             sent = int(sent_info[0] or 0)
             set_task_status(task_id, "running")
 
+            # If this is a retry, notify user
+            if retry_count > 0:
+                try:
+                    send_message(user_id, f"🔄 Retrying your task (attempt {retry_count + 1})...")
+                except Exception:
+                    pass
+
             interval = 0.5 if total <= 150 else (0.6 if total <= 300 else 0.7)
             est_seconds = int((total - sent) * interval)
             est_str = str(timedelta(seconds=est_seconds))
@@ -880,6 +992,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             i = sent
             last_send_time = time.monotonic()
             last_activity_update = time.monotonic()
+            consecutive_errors = 0  # Track consecutive errors
 
             while i < total and not stop_event.is_set():
                 # Update activity periodically
@@ -929,10 +1042,32 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         break
 
                 try:
-                    send_message(user_id, words[i])
-                    record_split_log(user_id, uname_for_stat, 1)
+                    result = send_message(user_id, words[i])
+                    if result:  # Success
+                        consecutive_errors = 0
+                        record_split_log(user_id, uname_for_stat, 1)
+                    else:  # Failure
+                        consecutive_errors += 1
+                        logger.warning(f"Failed to send word {i+1} to user {user_id} (consecutive errors: {consecutive_errors})")
+                        
+                        # If too many consecutive errors, pause task temporarily
+                        if consecutive_errors >= 10:
+                            logger.error(f"Too many consecutive errors ({consecutive_errors}) for user {user_id}. Pausing task.")
+                            set_task_status(task_id, "paused")
+                            try:
+                                send_message(user_id, f"⚠️ Task paused due to sending errors. Will retry in 30 seconds.")
+                            except Exception:
+                                pass
+                            time.sleep(30)  # Wait before retrying
+                            set_task_status(task_id, "running")
+                            consecutive_errors = 0
+                            continue
+                        
+                        # Still count as sent for logging purposes
+                        record_split_log(user_id, uname_for_stat, 1)
                 except Exception as e:
-                    logger.warning(f"Failed to send word {i+1} to user {user_id}: {e}")
+                    logger.error(f"Exception sending word {i+1} to user {user_id}: {e}")
+                    consecutive_errors += 1
                     record_split_log(user_id, uname_for_stat, 1)
 
                 i += 1
@@ -1091,7 +1226,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10), timezone='UTC')
 scheduler.add_job(check_and_lift, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=15), timezone='UTC')
 scheduler.add_job(prune_old_logs, "interval", hours=24, next_run_time=datetime.utcnow() + timedelta(seconds=30), timezone='UTC')
-scheduler.add_job(check_stuck_tasks, "interval", minutes=2, next_run_time=datetime.utcnow() + timedelta(seconds=45), timezone='UTC')
+scheduler.add_job(check_stuck_tasks, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=45), timezone='UTC')
 scheduler.start()
 
 def _graceful_shutdown(signum, frame):
