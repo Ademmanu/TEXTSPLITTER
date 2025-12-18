@@ -881,7 +881,7 @@ def check_stuck_tasks():
         cutoff = (datetime.utcnow() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
         with _db_lock:
             c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT id, user_id, status, retry_count FROM tasks WHERE status IN ('running', 'paused') AND last_activity < ?", (cutoff,))
+            c.execute("SELECT id, user_id, status, retry_count FROM tasks WHERE status = 'running' AND last_activity < ?", (cutoff,))
             stuck_tasks = c.fetchall()
             
             for task_id, user_id, status, retry_count in stuck_tasks:
