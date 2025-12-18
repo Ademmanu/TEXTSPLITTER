@@ -1433,7 +1433,7 @@ def webhook():
                 return jsonify({"ok": True})
             
             elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_checkpreview"]:
-                # Operations that require additional input
+                # Operations that require additional input - SEND NEW MESSAGE instead of editing
                 operation = data.replace("owner_", "")
                 set_owner_state(uid, {"operation": operation, "step": 0})
                 
@@ -1444,21 +1444,18 @@ def webhook():
                     "checkpreview": "🔍 Please send the User ID to check:"
                 }
                 
+                # Send a NEW message instead of editing the menu
                 cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
                 
                 try:
-                    _session.post(f"{TELEGRAM_API}/editMessageText", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": f"⚠️ {prompts[operation]}\n\nPlease send the requested information as a text message.",
-                        "reply_markup": cancel_keyboard
-                    }, timeout=2)
+                    # Send new message for input
+                    send_message(uid, f"⚠️ {prompts[operation]}\n\nPlease send the requested information as a text message.", cancel_keyboard)
                 except Exception:
                     pass
                 try:
                     _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
                         "callback_query_id": callback.get("id"),
-                        "text": "ℹ️ Please send the requested info."
+                        "text": "ℹ️ Please check your new message."
                     }, timeout=2)
                 except Exception:
                     pass
@@ -1466,7 +1463,6 @@ def webhook():
             
             elif data == "owner_cancelinput":
                 clear_owner_state(uid)
-                send_ownersets_menu(uid)
                 try:
                     _session.post(f"{TELEGRAM_API}/deleteMessage", json={
                         "chat_id": callback["message"]["chat"]["id"],
