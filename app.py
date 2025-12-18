@@ -94,7 +94,7 @@ def label_for_owner_view(target_id: int, target_username: str) -> str:
 
 OWNER_TAG = "Owner (@justmemmy)"
 
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()  # Changed to RLock for nested locking
 GLOBAL_DB_CONN: sqlite3.Connection = None
 
 def _ensure_db_parent(dirpath: str):
@@ -134,7 +134,8 @@ def init_db():
             status TEXT,
             created_at TEXT,
             started_at TEXT,
-            finished_at TEXT
+            finished_at TEXT,
+            last_activity TEXT
         )""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS split_logs (
@@ -605,8 +606,8 @@ def enqueue_task(user_id: int, username: str, text: str):
         if pending >= MAX_QUEUE_PER_USER:
             return {"ok": False, "reason": "queue_full", "queue_size": pending}
         try:
-            c.execute("INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at, sent_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                      (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0))
+            c.execute("INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at, sent_count, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0, now_ts()))
             GLOBAL_DB_CONN.commit()
         except Exception:
             logger.exception("enqueue_task db error")
@@ -626,11 +627,18 @@ def set_task_status(task_id: int, status: str):
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
         if status == "running":
-            c.execute("UPDATE tasks SET status = ?, started_at = ? WHERE id = ?", (status, now_ts(), task_id))
+            c.execute("UPDATE tasks SET status = ?, started_at = ?, last_activity = ? WHERE id = ?", (status, now_ts(), now_ts(), task_id))
         elif status in ("done", "cancelled"):
-            c.execute("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", (status, now_ts(), task_id))
+            c.execute("UPDATE tasks SET status = ?, finished_at = ?, last_activity = ? WHERE id = ?", (status, now_ts(), now_ts(), task_id))
         else:
-            c.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+            c.execute("UPDATE tasks SET status = ?, last_activity = ? WHERE id = ?", (status, now_ts(), task_id))
+        GLOBAL_DB_CONN.commit()
+
+def update_task_activity(task_id: int):
+    """Update the last_activity timestamp for a task"""
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("UPDATE tasks SET last_activity = ? WHERE id = ?", (now_ts(), task_id))
         GLOBAL_DB_CONN.commit()
 
 def cancel_active_task_for_user(user_id: int):
@@ -774,6 +782,27 @@ def stop_user_worker(user_id: int, join_timeout: float = 0.5):
             _user_workers.pop(user_id, None)
             logger.info("Stopped worker for user %s", user_id)
 
+def check_stuck_tasks():
+    """Check for tasks that haven't had activity in over 5 minutes and mark them as stuck"""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        with _db_lock:
+            c = GLOBAL_DB_CONN.cursor()
+            c.execute("SELECT id, user_id, status FROM tasks WHERE status IN ('running', 'paused') AND last_activity < ?", (cutoff,))
+            stuck_tasks = c.fetchall()
+            
+            for task_id, user_id, status in stuck_tasks:
+                logger.warning(f"Stuck task detected: task_id={task_id}, user_id={user_id}, status={status}")
+                # Mark as cancelled and restart worker
+                c.execute("UPDATE tasks SET status = 'cancelled', finished_at = ? WHERE id = ?", (now_ts(), task_id))
+                notify_user_worker(user_id)
+            
+            if stuck_tasks:
+                GLOBAL_DB_CONN.commit()
+                logger.info(f"Cleaned up {len(stuck_tasks)} stuck tasks")
+    except Exception:
+        logger.exception("Error checking for stuck tasks")
+
 def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: threading.Event):
     logger.info("Worker loop starting for user %s", user_id)
     acquired_semaphore = False
@@ -809,12 +838,17 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             if not sent_info or sent_info[1] == "cancelled":
                 continue
 
+            # Update task activity before acquiring semaphore
+            update_task_activity(task_id)
+
             # Acquire concurrency semaphore
             while not stop_event.is_set():
                 acquired = _active_workers_semaphore.acquire(timeout=1.0)
                 if acquired:
                     acquired_semaphore = True
                     break
+                # Update activity while waiting
+                update_task_activity(task_id)
                 with _db_lock:
                     c = GLOBAL_DB_CONN.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
@@ -845,8 +879,14 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
 
             i = sent
             last_send_time = time.monotonic()
+            last_activity_update = time.monotonic()
 
             while i < total and not stop_event.is_set():
+                # Update activity periodically
+                if time.monotonic() - last_activity_update > 30:  # Update every 30 seconds
+                    update_task_activity(task_id)
+                    last_activity_update = time.monotonic()
+                
                 with _db_lock:
                     c = GLOBAL_DB_CONN.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
@@ -879,6 +919,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                             except Exception:
                                 pass
                             last_send_time = time.monotonic()
+                            last_activity_update = time.monotonic()
                             break
                     if status == "cancelled" or is_suspended(user_id) or stop_event.is_set():
                         if is_suspended(user_id):
@@ -890,7 +931,8 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 try:
                     send_message(user_id, words[i])
                     record_split_log(user_id, uname_for_stat, 1)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Failed to send word {i+1} to user {user_id}: {e}")
                     record_split_log(user_id, uname_for_stat, 1)
 
                 i += 1
@@ -898,7 +940,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 try:
                     with _db_lock:
                         c = GLOBAL_DB_CONN.cursor()
-                        c.execute("UPDATE tasks SET sent_count = ? WHERE id = ?", (i, task_id))
+                        c.execute("UPDATE tasks SET sent_count = ?, last_activity = ? WHERE id = ?", (i, now_ts(), task_id))
                         GLOBAL_DB_CONN.commit()
                 except Exception:
                     logger.exception("Failed to update sent_count for task %s", task_id)
@@ -1049,6 +1091,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10), timezone='UTC')
 scheduler.add_job(check_and_lift, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=15), timezone='UTC')
 scheduler.add_job(prune_old_logs, "interval", hours=24, next_run_time=datetime.utcnow() + timedelta(seconds=30), timezone='UTC')
+scheduler.add_job(check_stuck_tasks, "interval", minutes=2, next_run_time=datetime.utcnow() + timedelta(seconds=45), timezone='UTC')
 scheduler.start()
 
 def _graceful_shutdown(signum, frame):
