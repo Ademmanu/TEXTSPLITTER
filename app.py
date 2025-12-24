@@ -1311,19 +1311,34 @@ def get_user_tasks_preview(user_id: int, hours: int, page: int = 0) -> Tuple[Lis
     
     return paginated_tasks, total_tasks, total_pages
 
+def get_all_users_ordered():
+    """Get all users ordered by added_at DESC (same as listusers)"""
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC")
+        return c.fetchall()
+
+def get_user_index(user_id: int):
+    """Get the index of a user in the ordered users list"""
+    users = get_all_users_ordered()
+    for i, (uid, username, added_at) in enumerate(users):
+        if uid == user_id:
+            return i, users
+    return -1, users
+
 def send_ownersets_menu(owner_id: int):
     """Send the main owner menu with inline buttons"""
     menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
     
     # Updated layout as requested:
     # - 4 rows only
-    # - Fourth row has only "Check User Preview"
+    # - Fourth row has only "Check All User Preview" (renamed)
     # - No "Close Menu" button
     keyboard = [
         [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
         [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
         [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-        [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
+        [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]  # RENAMED
     ]
     
     reply_markup = {"inline_keyboard": keyboard}
@@ -1426,7 +1441,7 @@ def webhook():
                     [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
                     [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
                     [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                    [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
+                    [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]  # RENAMED
                 ]
                 
                 try:
@@ -1466,7 +1481,7 @@ def webhook():
                     [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
                     [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
                     [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                    [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
+                    [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]  # RENAMED
                 ]
                 
                 try:
@@ -1514,7 +1529,7 @@ def webhook():
                     [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
                     [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
                     [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                    [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
+                    [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]  # RENAMED
                 ]
                 
                 try:
@@ -1553,91 +1568,150 @@ def webhook():
                     pass
                 return jsonify({"ok": True})
             
-            elif data.startswith("owner_checkpreview_"):
-                # Handle pagination for check preview - FIXED VERSION
+            elif data.startswith("owner_checkallpreview_"):
+                # Handle navigation for check all user preview
                 parts = data.split("_")
-                if len(parts) == 4:  # owner_checkpreview_userid_page
+                
+                if len(parts) == 5:  # owner_checkallpreview_userid_page_hours
                     target_user = int(parts[2])
                     page = int(parts[3])
-                    # We need to get the hours from state or use default
-                    state = get_owner_state(uid)
-                    hours = state.get("hours", 24) if state else 24
+                    hours = int(parts[4])
                     
+                    # Get user index and all users
+                    user_index, all_users = get_user_index(target_user)
+                    if user_index == -1:
+                        # User not found, go back to first user
+                        if all_users:
+                            target_user = all_users[0][0]
+                            user_index = 0
+                        else:
+                            # No users at all
+                            try:
+                                _session.post(f"{TELEGRAM_API}/editMessageText", json={
+                                    "chat_id": callback["message"]["chat"]["id"],
+                                    "message_id": callback["message"]["message_id"],
+                                    "text": "📋 No users found.",
+                                }, timeout=2)
+                            except Exception:
+                                pass
+                            return jsonify({"ok": True})
+                    
+                    # Get tasks for the current user
                     tasks, total_tasks, total_pages = get_user_tasks_preview(target_user, hours, page)
                     
+                    # Get user info
+                    user_info = all_users[user_index]
+                    user_id_info, username_info, added_at_info = user_info
+                    username_display = at_username(username_info) if username_info else "no username"
+                    added_wat = utc_to_wat_ts(added_at_info)
+                    
                     if not tasks:
-                        body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
+                        body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n📋 No tasks found in the last {hours} hours."
                     else:
                         lines = []
                         for task in tasks:
                             lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
                         
-                        body = f"📋 Task preview for user {target_user} (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
+                        body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n\n📋 Tasks (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
                     
-                    # Create keyboard with navigation buttons if needed
+                    # Create navigation buttons
                     keyboard = []
-                    nav_buttons = []
+                    
+                    # Task pagination buttons
+                    task_nav = []
                     if page > 0:
-                        nav_buttons.append({"text": "⬅️ Previous", "callback_data": f"owner_checkpreview_{target_user}_{page-1}"})
+                        task_nav.append({"text": "⬅️ Prev Page", "callback_data": f"owner_checkallpreview_{target_user}_{page-1}_{hours}"})
                     if page + 1 < total_pages:
-                        nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"})
-                    if nav_buttons:
-                        keyboard.append(nav_buttons)
+                        task_nav.append({"text": "Next Page ➡️", "callback_data": f"owner_checkallpreview_{target_user}_{page+1}_{hours}"})
+                    if task_nav:
+                        keyboard.append(task_nav)
                     
-                    # Add the regular menu buttons
-                    keyboard.extend([
-                        [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-                        [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-                        [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                        [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
-                    ])
+                    # User navigation buttons
+                    user_nav = []
+                    if user_index > 0:
+                        prev_user_id = all_users[user_index-1][0]
+                        user_nav.append({"text": "⬅️ Prev User", "callback_data": f"owner_checkallpreview_{prev_user_id}_0_{hours}"})
                     
-                    menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
+                    user_nav.append({"text": f"User {user_index+1}/{len(all_users)}", "callback_data": "owner_checkallpreview_noop"})
+                    
+                    if user_index + 1 < len(all_users):
+                        next_user_id = all_users[user_index+1][0]
+                        user_nav.append({"text": "Next User ➡️", "callback_data": f"owner_checkallpreview_{next_user_id}_0_{hours}"})
+                    
+                    if user_nav:
+                        keyboard.append(user_nav)
+                    
+                    # Add back to menu button
+                    keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
                     
                     try:
                         _session.post(f"{TELEGRAM_API}/editMessageText", json={
                             "chat_id": callback["message"]["chat"]["id"],
                             "message_id": callback["message"]["message_id"],
-                            "text": menu_text,
+                            "text": body,
                             "reply_markup": {"inline_keyboard": keyboard}
                         }, timeout=2)
                     except Exception:
                         pass
+                    
+                elif data == "owner_checkallpreview_noop":
+                    # No operation - just answer the callback query
                     try:
                         _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
                             "callback_query_id": callback.get("id")
                         }, timeout=2)
                     except Exception:
                         pass
+                    
                 return jsonify({"ok": True})
             
-            elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_checkpreview"]:
+            elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_checkallpreview"]:
                 # Operations that require additional input - SEND NEW MESSAGE instead of editing
                 operation = data.replace("owner_", "")
-                set_owner_state(uid, {"operation": operation, "step": 0})
                 
-                prompts = {
-                    "adduser": "👤 Please send the User ID to add (you can add multiple IDs separated by spaces or commas):",
-                    "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d)\n3. Optional reason\n\nExample: 123456789 30s Too many requests",
-                    "unsuspend": "▶️ Please send the User ID to unsuspend:",
-                    "checkpreview": "🔍 Please send the User ID to check:"
-                }
-                
-                # Send a NEW message instead of editing the menu
-                cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
-                
-                try:
-                    # Send new message for input
-                    send_message(uid, f"⚠️ {prompts[operation]}\n\nPlease send the requested information as a text message.", cancel_keyboard)
-                except Exception:
-                    pass
-                try:
-                    _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "ℹ️ Please check your new message."
-                    }, timeout=2)
-                except Exception:
-                    pass
+                if operation == "checkallpreview":
+                    # For check all user preview, ask for hours first
+                    set_owner_state(uid, {"operation": operation, "step": 0})
+                    
+                    cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
+                    
+                    try:
+                        # Send new message for input
+                        send_message(uid, "⏰ How many hours back should I check? (e.g., 1, 6, 24, 168):", cancel_keyboard)
+                    except Exception:
+                        pass
+                    try:
+                        _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
+                            "callback_query_id": callback.get("id"),
+                            "text": "ℹ️ Please check your new message."
+                        }, timeout=2)
+                    except Exception:
+                        pass
+                else:
+                    # For other operations, use existing prompts
+                    set_owner_state(uid, {"operation": operation, "step": 0})
+                    
+                    prompts = {
+                        "adduser": "👤 Please send the User ID to add (you can add multiple IDs separated by spaces or commas):",
+                        "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d)\n3. Optional reason\n\nExample: 123456789 30s Too many requests",
+                        "unsuspend": "▶️ Please send the User ID to unsuspend:",
+                    }
+                    
+                    # Send a NEW message instead of editing the menu
+                    cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
+                    
+                    try:
+                        # Send new message for input
+                        send_message(uid, f"⚠️ {prompts[operation]}\n\nPlease send the requested information as a text message.", cancel_keyboard)
+                    except Exception:
+                        pass
+                    try:
+                        _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
+                            "callback_query_id": callback.get("id"),
+                            "text": "ℹ️ Please check your new message."
+                        }, timeout=2)
+                    except Exception:
+                        pass
                 return jsonify({"ok": True})
             
             elif data == "owner_cancelinput":
@@ -1759,7 +1833,7 @@ def webhook():
                             clear_owner_state(uid)
                             # Send completion message
                             send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                            return jsonify({"ok": True})
+                            return jsonify({"ok": True}")
                     
                     elif operation == "unsuspend":
                         try:
@@ -1777,28 +1851,11 @@ def webhook():
                         clear_owner_state(uid)
                         # Send completion message
                         send_message(uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
-                        return jsonify({"ok": True})
+                        return jsonify({"ok": True}")
                     
-                    elif operation == "checkpreview":
+                    elif operation == "checkallpreview":
                         if step == 0:
-                            # First step: get user ID
-                            try:
-                                target_user = int(text.strip())
-                            except Exception:
-                                send_message(uid, "❌ Invalid User ID. Please try again.")
-                                return jsonify({"ok": True})
-                            
-                            # Save user ID and ask for hours
-                            state["user_id"] = target_user
-                            state["step"] = 1
-                            set_owner_state(uid, state)
-                            
-                            cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
-                            send_message(uid, "⏰ How many hours back should I check? (e.g., 1, 6, 24, 168):", cancel_keyboard)
-                            return jsonify({"ok": True})
-                        
-                        elif step == 1:
-                            # Second step: get hours
+                            # First step: get hours
                             try:
                                 hours = int(text.strip())
                                 if hours <= 0:
@@ -1807,43 +1864,56 @@ def webhook():
                                 send_message(uid, "❌ Please enter a valid positive number of hours.")
                                 return jsonify({"ok": True})
                             
-                            target_user = state.get("user_id")
-                            state["hours"] = hours
-                            set_owner_state(uid, state)
+                            # Get all users ordered
+                            all_users = get_all_users_ordered()
+                            if not all_users:
+                                clear_owner_state(uid)
+                                send_message(uid, "📋 No users found.")
+                                return jsonify({"ok": True})
                             
-                            # Get tasks preview
-                            tasks, total_tasks, total_pages = get_user_tasks_preview(target_user, hours, 0)
+                            # Get first user
+                            first_user_id, first_username, first_added_at = all_users[0]
+                            username_display = at_username(first_username) if first_username else "no username"
+                            added_wat = utc_to_wat_ts(first_added_at)
+                            
+                            # Get tasks for first user
+                            tasks, total_tasks, total_pages = get_user_tasks_preview(first_user_id, hours, 0)
                             
                             if not tasks:
-                                body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
+                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n📋 No tasks found in the last {hours} hours."
                             else:
                                 lines = []
                                 for task in tasks:
                                     lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
                                 
-                                body = f"📋 Task preview for user {target_user} (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
+                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n\n📋 Tasks (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
                             
-                            # Create keyboard with navigation if needed
+                            # Create navigation buttons
                             keyboard = []
-                            nav_buttons = []
-                            if total_pages > 1:
-                                nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_1"})
-                            if nav_buttons:
-                                keyboard.append(nav_buttons)
                             
-                            # Add the regular menu buttons
-                            keyboard.extend([
-                                [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-                                [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-                                [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                                [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
-                            ])
+                            # Task pagination buttons
+                            task_nav = []
+                            if total_pages > 1:
+                                task_nav.append({"text": "Next Page ➡️", "callback_data": f"owner_checkallpreview_{first_user_id}_1_{hours}"})
+                            if task_nav:
+                                keyboard.append(task_nav)
+                            
+                            # User navigation buttons
+                            user_nav = []
+                            user_nav.append({"text": f"User 1/{len(all_users)}", "callback_data": "owner_checkallpreview_noop"})
+                            
+                            if len(all_users) > 1:
+                                next_user_id = all_users[1][0]
+                                user_nav.append({"text": "Next User ➡️", "callback_data": f"owner_checkallpreview_{next_user_id}_0_{hours}"})
+                            
+                            if user_nav:
+                                keyboard.append(user_nav)
+                            
+                            # Add back to menu button
+                            keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
                             
                             clear_owner_state(uid)
-                            menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
-                            
-                            # Send the preview with menu buttons
-                            send_message(uid, menu_text, {"inline_keyboard": keyboard})
+                            send_message(uid, body, {"inline_keyboard": keyboard})
                             return jsonify({"ok": True})
             
             # Handle commands
