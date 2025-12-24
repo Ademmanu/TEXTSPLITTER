@@ -1932,7 +1932,7 @@ def webhook():
                                     raise ValueError
                             except Exception:
                                 send_message(uid, "❌ Please enter a valid positive number of hours.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             # Get all users ordered
                             all_users = get_all_users_ordered()
