@@ -143,6 +143,13 @@ OWNER_TAG = "Owner (@justmemmy)"
 _db_lock = threading.RLock()
 GLOBAL_DB_CONN: sqlite3.Connection = None
 
+def _check_db():
+    """Check if database connection is available"""
+    if GLOBAL_DB_CONN is None:
+        logger.error("Database connection not available")
+        return False
+    return True
+
 def _ensure_db_parent(dirpath: str):
     try:
         if dirpath and not os.path.exists(dirpath):
@@ -207,7 +214,6 @@ def init_db():
             reason TEXT,
             added_at TEXT
         )""")
-        # New schema: send_failures with notified and last error details
         c.execute("""
         CREATE TABLE IF NOT EXISTS send_failures (
             user_id INTEGER PRIMARY KEY,
@@ -217,6 +223,11 @@ def init_db():
             last_error_code INTEGER,
             last_error_desc TEXT
         )""")
+        # Create indexes for performance
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_split_logs_user_created ON split_logs(user_id, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sent_messages_sent_at ON sent_messages(sent_at)")
         conn.commit()
 
     try:
@@ -253,6 +264,8 @@ def ensure_send_failures_columns():
     Ensure migration: if older DB lacks columns (notified, last_error_code, last_error_desc),
     try to add them via ALTER TABLE (best effort).
     """
+    if not _check_db():
+        return
     try:
         with _db_lock:
             c = GLOBAL_DB_CONN.cursor()
@@ -269,7 +282,6 @@ def ensure_send_failures_columns():
                 try:
                     c.execute(stmt)
                 except Exception:
-                    # Ignore - maybe older sqlite can't alter; it's best-effort
                     logger.debug("Migration statement failed: %s", stmt)
             GLOBAL_DB_CONN.commit()
     except Exception:
@@ -513,8 +525,8 @@ def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None):
         record_failure(chat_id, inc=1, description="token_acquire_timeout")
         return None
 
-    # We'll attempt a small number of retries for transient/network errors
-    max_attempts = 3
+    # Attempt limited retries (session already has retry logic)
+    max_attempts = 2
     attempt = 0
     backoff_base = 0.5
     
@@ -681,6 +693,8 @@ def split_text_to_words(text: str) -> List[str]:
     return [w for w in text.strip().split() if w]
 
 def enqueue_task(user_id: int, username: str, text: str):
+    if not _check_db():
+        return {"ok": False, "reason": "db_error"}
     words = split_text_to_words(text)
     total = len(words)
     if total == 0:
@@ -701,6 +715,8 @@ def enqueue_task(user_id: int, username: str, text: str):
     return {"ok": True, "total_words": total, "queue_size": pending + 1}
 
 def get_next_task_for_user(user_id: int):
+    if not _check_db():
+        return None
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
         c.execute("SELECT id, words_json, total_words, text, retry_count FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
@@ -710,6 +726,8 @@ def get_next_task_for_user(user_id: int):
     return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), "total_words": r[2], "text": r[3], "retry_count": r[4]}
 
 def set_task_status(task_id: int, status: str):
+    if not _check_db():
+        return
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
         if status == "running":
@@ -762,6 +780,8 @@ def record_split_log(user_id: int, username: str, count: int = 1):
 def is_allowed(user_id: int) -> bool:
     if user_id in OWNER_IDS:
         return True
+    if not _check_db():
+        return False
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
         c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
@@ -961,14 +981,17 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 if not row_check or row_check[0] == "cancelled":
                     break
 
+            # Check task status after acquiring semaphore (fix race condition)
+            if not acquired_semaphore:
+                continue
+
             with _db_lock:
                 c = GLOBAL_DB_CONN.cursor()
                 c.execute("SELECT sent_count, status FROM tasks WHERE id = ?", (task_id,))
                 sent_info = c.fetchone()
             if not sent_info or sent_info[1] == "cancelled":
-                if acquired_semaphore:
-                    _active_workers_semaphore.release()
-                    acquired_semaphore = False
+                _active_workers_semaphore.release()
+                acquired_semaphore = False
                 continue
 
             sent = int(sent_info[0] or 0)
@@ -992,14 +1015,15 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             i = sent
             last_send_time = time.monotonic()
             last_activity_update = time.monotonic()
-            consecutive_errors = 0  # Track consecutive errors
+            last_db_update = time.monotonic()
+            consecutive_errors = 0
 
             while i < total and not stop_event.is_set():
                 # Update activity periodically
-                if time.monotonic() - last_activity_update > 30:  # Update every 30 seconds
+                if time.monotonic() - last_activity_update > 30:
                     update_task_activity(task_id)
                     last_activity_update = time.monotonic()
-                
+
                 with _db_lock:
                     c = GLOBAL_DB_CONN.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
@@ -1024,9 +1048,12 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                             c_check = GLOBAL_DB_CONN.cursor()
                             c_check.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                             row2 = c_check.fetchone()
-                        if not row2 or row2[0] == "cancelled" or is_suspended(user_id):
+                        if not row2:
                             break
-                        if row2[0] == "running":
+                        current_status = row2[0]
+                        if current_status == "cancelled" or is_suspended(user_id):
+                            break
+                        if current_status == "running":
                             try:
                                 send_message(user_id, "▶️ Resuming your task now.")
                             except Exception:
@@ -1034,7 +1061,12 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                             last_send_time = time.monotonic()
                             last_activity_update = time.monotonic()
                             break
-                    if status == "cancelled" or is_suspended(user_id) or stop_event.is_set():
+                    # Check final status after pause loop
+                    with _db_lock:
+                        c = GLOBAL_DB_CONN.cursor()
+                        c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                        final_pause_status_row = c.fetchone()
+                    if not final_pause_status_row or final_pause_status_row[0] == "cancelled" or is_suspended(user_id) or stop_event.is_set():
                         if is_suspended(user_id):
                             set_task_status(task_id, "cancelled")
                             try: send_message(user_id, "⛔ You have been suspended; stopping your task.")
@@ -1043,14 +1075,13 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
 
                 try:
                     result = send_message(user_id, words[i])
-                    if result:  # Success
+                    if result:
                         consecutive_errors = 0
                         record_split_log(user_id, uname_for_stat, 1)
-                    else:  # Failure
+                    else:
                         consecutive_errors += 1
                         logger.warning(f"Failed to send word {i+1} to user {user_id} (consecutive errors: {consecutive_errors})")
-                        
-                        # If too many consecutive errors, pause task temporarily
+
                         if consecutive_errors >= 10:
                             logger.error(f"Too many consecutive errors ({consecutive_errors}) for user {user_id}. Pausing task.")
                             set_task_status(task_id, "paused")
@@ -1058,12 +1089,11 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                                 send_message(user_id, f"⚠️ Task paused due to sending errors. Will retry in 30 seconds.")
                             except Exception:
                                 pass
-                            time.sleep(30)  # Wait before retrying
+                            time.sleep(30)
                             set_task_status(task_id, "running")
                             consecutive_errors = 0
                             continue
-                        
-                        # Still count as sent for logging purposes
+
                         record_split_log(user_id, uname_for_stat, 1)
                 except Exception as e:
                     logger.error(f"Exception sending word {i+1} to user {user_id}: {e}")
@@ -1072,13 +1102,16 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
 
                 i += 1
 
-                try:
-                    with _db_lock:
-                        c = GLOBAL_DB_CONN.cursor()
-                        c.execute("UPDATE tasks SET sent_count = ?, last_activity = ? WHERE id = ?", (i, now_ts(), task_id))
-                        GLOBAL_DB_CONN.commit()
-                except Exception:
-                    logger.exception("Failed to update sent_count for task %s", task_id)
+                # Batch DB updates every 10 words or 5 seconds for performance
+                if (i % 10 == 0) or (time.monotonic() - last_db_update > 5):
+                    try:
+                        with _db_lock:
+                            c = GLOBAL_DB_CONN.cursor()
+                            c.execute("UPDATE tasks SET sent_count = ?, last_activity = ? WHERE id = ?", (i, now_ts(), task_id))
+                            GLOBAL_DB_CONN.commit()
+                        last_db_update = time.monotonic()
+                    except Exception:
+                        logger.exception("Failed to update sent_count for task %s", task_id)
 
                 if wake_event.is_set():
                     wake_event.clear()
@@ -1093,6 +1126,15 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
 
                 if is_suspended(user_id):
                     break
+
+            # Final DB update to ensure sent_count is current
+            try:
+                with _db_lock:
+                    c = GLOBAL_DB_CONN.cursor()
+                    c.execute("UPDATE tasks SET sent_count = ?, last_activity = ? WHERE id = ?", (i, now_ts(), task_id))
+                    GLOBAL_DB_CONN.commit()
+            except Exception:
+                logger.exception("Failed final sent_count update for task %s", task_id)
 
             with _db_lock:
                 c = GLOBAL_DB_CONN.cursor()
@@ -1460,15 +1502,13 @@ def webhook():
             elif data == "owner_botinfo":
                 # Get bot info and edit the message to show it, keeping the menu buttons
                 active_rows, queued_tasks = [], 0
-                with _db_lock:
-                    c = GLOBAL_DB_CONN.cursor()
-                    c.execute("SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id")
-                    active_rows = c.fetchall()
-                    c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
-                    queued_tasks = c.fetchone()[0]
                 queued_counts = {}
                 with _db_lock:
                     c = GLOBAL_DB_CONN.cursor()
+                    c.execute("SELECT user_id, username, SUM(total_words - COALESCE(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id")
+                    active_rows = c.fetchall()
+                    c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
+                    queued_tasks = c.fetchone()[0]
                     c.execute("SELECT user_id, COUNT(*) FROM tasks WHERE status = 'queued' GROUP BY user_id")
                     for row in c.fetchall():
                         queued_counts[row[0]] = row[1]
