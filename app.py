@@ -2194,10 +2194,15 @@ def set_webhook():
     except Exception:
         logger.exception("set_webhook failed")
 
-if __name__ == "__main__":
+def main():
     try:
         set_webhook()
     except Exception:
         pass
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    main()
+else:
+    pass
