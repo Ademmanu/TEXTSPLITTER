@@ -2194,6 +2194,7 @@ def set_webhook():
     except Exception:
         logger.exception("set_webhook failed")
 
+
 def main():
     try:
         set_webhook()
