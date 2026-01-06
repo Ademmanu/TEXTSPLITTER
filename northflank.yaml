@@ -8,7 +8,7 @@ services:
       - 8080
     env:
       - name: PORT
-        value: "8080"
+        value: 8080
       - name: TELEGRAM_TOKEN
         description: "Your Telegram Bot Token from @BotFather"
         secret: true
