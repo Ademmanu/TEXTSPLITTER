@@ -2293,7 +2293,7 @@ def handle_user_text_for_bot(bot_id: str, user_id: int, username: str, text: str
     if user_id not in config["owner_ids"] and not is_allowed_for_bot(bot_id, user_id):
         send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed. {config['owner_tag']} notified.\nYour ID: {user_id}")
         notify_owners_for_bot(bot_id, f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
-        return jsonify({"ok": True}")
+        return jsonify({"ok": True})
     
     if is_suspended_for_bot(bot_id, user_id):
         with DB_LOCKS[bot_id]:
