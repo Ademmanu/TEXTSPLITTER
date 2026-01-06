@@ -156,9 +156,23 @@ def init_db():
     Also creates tables and runs lightweight schema migration for added columns.
     """
     global DB_PATH, GLOBAL_DB_CONN
+    
+    # FIX: Ensure DB_PATH points to a writable location
+    if not DB_PATH or DB_PATH == "botdata.sqlite3":
+        DB_PATH = "/tmp/botdata.sqlite3"
+    
+    # Ensure the directory exists
     parent = os.path.dirname(os.path.abspath(DB_PATH))
     if parent:
         _ensure_db_parent(parent)
+    
+    # Also try to create the file if it doesn't exist (for permissions)
+    try:
+        if not os.path.exists(DB_PATH):
+            with open(DB_PATH, 'w') as f:
+                f.write('')  # Create empty file
+    except Exception as e:
+        logger.warning("Could not create DB file %s: %s", DB_PATH, e)
 
     def _create_schema(conn):
         c = conn.cursor()
