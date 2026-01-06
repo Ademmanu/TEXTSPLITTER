@@ -2123,7 +2123,7 @@ def handle_webhook(bot_id: str):
                             
                             clear_owner_state(bot_id, uid)
                             send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                            return jsonify({"ok": True}")
+                            return jsonify({"ok": True})
                     
                     elif operation == "unsuspend":
                         try:
