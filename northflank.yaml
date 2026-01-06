@@ -1,7 +1,6 @@
-
 version: '1'
 services:
-  word-splitter-multi-bot:
+  multi-bot-wordsplitter:
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,120 +9,94 @@ services:
     env:
       # Port configuration
       - name: PORT
-        value: "8080"
+        value: 8080
       
-      # ===== BOT A CONFIGURATION (Fast Interval) =====
+      # Bot A Configuration
       - name: TELEGRAM_TOKEN_A
         description: "Telegram Bot Token for Bot A from @BotFather"
         secret: true
       - name: WEBHOOK_URL_A
-        description: "Full webhook URL for Bot A (will be provided after deployment)"
+        description: "Full webhook URL for Bot A (e.g., https://yourserver.com/webhook/a)"
       - name: OWNER_IDS_A
         description: "Comma-separated Telegram user IDs for Bot A owners (e.g., 123456789,987654321)"
       - name: ALLOWED_USERS_A
         description: "Comma-separated allowed user IDs for Bot A"
-      - name: DB_PATH_A
-        value: "/tmp/botdata_a.sqlite3"
-      - name: USE_SLOW_INTERVAL_A
-        value: "false"
-      - name: OWNER_TAG_A
-        value: "Owner of Bot A"
       
-      # ===== BOT B CONFIGURATION (Fast Interval) =====
+      # Bot B Configuration
       - name: TELEGRAM_TOKEN_B
         description: "Telegram Bot Token for Bot B from @BotFather"
         secret: true
       - name: WEBHOOK_URL_B
-        description: "Full webhook URL for Bot B (will be provided after deployment)"
+        description: "Full webhook URL for Bot B (e.g., https://yourserver.com/webhook/b)"
       - name: OWNER_IDS_B
         description: "Comma-separated Telegram user IDs for Bot B owners"
       - name: ALLOWED_USERS_B
         description: "Comma-separated allowed user IDs for Bot B"
-      - name: DB_PATH_B
-        value: "/tmp/botdata_b.sqlite3"
-      - name: USE_SLOW_INTERVAL_B
-        value: "false"
-      - name: OWNER_TAG_B
-        value: "Owner of Bot B"
       
-      # ===== BOT C CONFIGURATION (SLOW Interval) =====
+      # Bot C Configuration
       - name: TELEGRAM_TOKEN_C
         description: "Telegram Bot Token for Bot C from @BotFather"
         secret: true
       - name: WEBHOOK_URL_C
-        description: "Full webhook URL for Bot C (will be provided after deployment)"
+        description: "Full webhook URL for Bot C (e.g., https://yourserver.com/webhook/c)"
       - name: OWNER_IDS_C
         description: "Comma-separated Telegram user IDs for Bot C owners"
       - name: ALLOWED_USERS_C
         description: "Comma-separated allowed user IDs for Bot C"
+      
+      # Database paths for each bot (with /tmp fix applied to all)
+      - name: DB_PATH_A
+        value: "/tmp/botdata_a.sqlite3"
+      - name: DB_PATH_B
+        value: "/tmp/botdata_b.sqlite3"
       - name: DB_PATH_C
         value: "/tmp/botdata_c.sqlite3"
-      - name: USE_SLOW_INTERVAL_C
-        value: "true"  # SLOW INTERVAL!
-      - name: OWNER_TAG_C
-        value: "Owner of Bot C"
       
-      # ===== SHARED CONFIGURATION (Can be overridden per bot) =====
-      # Defaults for all bots (can be overridden with _A, _B, _C suffixes)
-      - name: MAX_QUEUE_PER_USER
+      # Bot A & B specific settings (fast intervals - 0.5-0.7s)
+      - name: MAX_QUEUE_PER_USER_A
         value: "5"
-      - name: MAX_MSG_PER_SECOND
+      - name: MAX_MSG_PER_SECOND_A
         value: "50"
+      - name: MAX_CONCURRENT_WORKERS_A
+        value: "25"
+      
+      - name: MAX_QUEUE_PER_USER_B
+        value: "5"
+      - name: MAX_MSG_PER_SECOND_B
+        value: "50"
+      - name: MAX_CONCURRENT_WORKERS_B
+        value: "25"
+      
+      # Bot C specific settings (slow intervals - 1.0-1.2s)
+      - name: MAX_QUEUE_PER_USER_C
+        value: "5"
+      - name: MAX_MSG_PER_SECOND_C
+        value: "50"
+      - name: MAX_CONCURRENT_WORKERS_C
+        value: "25"
+      
+      # Shared settings for all bots
       - name: REQUESTS_TIMEOUT
         value: "10"
-      - name: MAX_CONCURRENT_WORKERS
-        value: "25"
       - name: LOG_RETENTION_DAYS
         value: "30"
       - name: FAILURE_NOTIFY_THRESHOLD
         value: "6"
       - name: PERMANENT_SUSPEND_DAYS
         value: "365"
-      
-      # Optional per-bot overrides (example for Bot A):
-      # - name: MAX_QUEUE_PER_USER_A
-      #   value: "10"
-      # - name: MAX_MSG_PER_SECOND_A
-      #   value: "100"
-    
-    # Database storage (if using persistent storage)
-    volumes:
-      - name: bot-data
-        mountPath: /tmp
-        # Optional: Use persistent volume for production
-        # persistentVolumeClaim:
-        #   claimName: bot-data-pvc
     
     resources:
-      memory: 512Mi
-      cpu: 500m
-    
-    # Health checks for all bots
+      memory: 768Mi  # Increased for 3 bots
+      cpu: 750m      # Increased for 3 bots
     healthCheck:
-      path: /health
+      # Multiple health endpoints available, using bot A as main health check
+      path: /health/a
       port: 8080
       initialDelay: 10
       period: 30
-      
-    # Additional health checks per bot (if needed):
-    # - path: /health/bot_a
-    # - path: /health/bot_b
-    # - path: /health/bot_c
-    
     autoscale:
       enabled: false
-      minReplicas: 1
-      maxReplicas: 3
-      targetCPUUtilization: 70
-    
     domains:
-      - host: word-splitter-multi-bot
+      - host: multi-bot-wordsplitter
         paths:
-          - /webhook/bot_a
-          - /webhook/bot_b
-          - /webhook/bot_c
-          - /health
-          - /health/bot_a
-          - /health/bot_b
-          - /health/bot_c
           - /
