@@ -52,7 +52,7 @@ BOT_CONFIGS = {
         "allowed_users": parse_id_list(os.environ.get("ALLOWED_USERS_A", "")),
         "db_path": os.environ.get("DB_PATH_A", ""),
         "use_slow_interval": os.environ.get("USE_SLOW_INTERVAL_A", "false").lower() == "true",
-        "owner_tag": os.environ.get("OWNER_TAG_A", "Owner of Bot A"),
+        "owner_tag": os.environ.get("OWNER_TAG_A", "Owner (@justmemmy)"),
         # Per-bot overrides or use shared defaults
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_A", os.environ.get("MAX_QUEUE_PER_USER", "5"))),
         "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", os.environ.get("MAX_MSG_PER_SECOND", "50"))),
@@ -69,7 +69,7 @@ BOT_CONFIGS = {
         "allowed_users": parse_id_list(os.environ.get("ALLOWED_USERS_B", "")),
         "db_path": os.environ.get("DB_PATH_B", ""),
         "use_slow_interval": os.environ.get("USE_SLOW_INTERVAL_B", "false").lower() == "true",
-        "owner_tag": os.environ.get("OWNER_TAG_B", "Owner of Bot B"),
+        "owner_tag": os.environ.get("OWNER_TAG_B", "Owner"),
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_B", os.environ.get("MAX_QUEUE_PER_USER", "5"))),
         "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", os.environ.get("MAX_MSG_PER_SECOND", "50"))),
         "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_B", os.environ.get("MAX_CONCURRENT_WORKERS", "25"))),
@@ -85,7 +85,7 @@ BOT_CONFIGS = {
         "allowed_users": parse_id_list(os.environ.get("ALLOWED_USERS_C", "")),
         "db_path": os.environ.get("DB_PATH_C", ""),
         "use_slow_interval": os.environ.get("USE_SLOW_INTERVAL_C", "true").lower() == "true",  # SLOW INTERVAL!
-        "owner_tag": os.environ.get("OWNER_TAG_C", "Owner of Bot C"),
+        "owner_tag": os.environ.get("OWNER_TAG_C", "Owner"),
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_C", os.environ.get("MAX_QUEUE_PER_USER", "5"))),
         "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", os.environ.get("MAX_MSG_PER_SECOND", "50"))),
         "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_C", os.environ.get("MAX_CONCURRENT_WORKERS", "25"))),
@@ -136,10 +136,15 @@ def label_for_owner_view(bot_id: str, target_id: int, target_username: str) -> s
     return str(target_id)
 
 # ============================================================================
-# DATABASE MANAGEMENT (PER-BOT)
+# DATABASE MANAGEMENT (PER-BOT) - FIXED INITIALIZATION
 # ============================================================================
 DB_CONNECTIONS: Dict[str, sqlite3.Connection] = {}
 DB_LOCKS: Dict[str, threading.RLock] = {}
+
+# Initialize ALL dictionaries for ALL configured bots first (FIX for KeyError)
+for bot_id in BOT_CONFIGS.keys():
+    DB_LOCKS[bot_id] = threading.RLock()
+    DB_CONNECTIONS[bot_id] = None  # Will be initialized later if bot is active
 
 def _ensure_db_parent(dirpath: str):
     try:
@@ -240,7 +245,6 @@ def init_db_for_bot(bot_id: str):
         conn.execute("PRAGMA busy_timeout=30000;")
         _create_schema(conn)
         DB_CONNECTIONS[bot_id] = conn
-        DB_LOCKS[bot_id] = threading.RLock()
         logger.info("DB initialized for %s at %s", bot_id, db_path)
     except Exception:
         logger.exception("Failed to open DB for %s at %s, falling back to in-memory DB", bot_id, db_path)
@@ -254,7 +258,6 @@ def init_db_for_bot(bot_id: str):
             conn.execute("PRAGMA busy_timeout=30000;")
             _create_schema(conn)
             DB_CONNECTIONS[bot_id] = conn
-            DB_LOCKS[bot_id] = threading.RLock()
             logger.info("In-memory DB initialized for %s", bot_id)
         except Exception:
             DB_CONNECTIONS[bot_id] = None
@@ -262,6 +265,9 @@ def init_db_for_bot(bot_id: str):
 
 def ensure_send_failures_columns_for_bot(bot_id: str):
     """Ensure migration for a specific bot's database"""
+    if not DB_CONNECTIONS.get(bot_id):
+        return
+    
     try:
         with DB_LOCKS[bot_id]:
             c = DB_CONNECTIONS[bot_id].cursor()
@@ -321,12 +327,21 @@ def initialize_all_bots():
                 try:
                     telegram_api = f"https://api.telegram.org/bot{config['token']}"
                     _session.post(f"{telegram_api}/sendMessage", json={
-                        "chat_id": uid, "text": f"✅ You have been added to {bot_id}. Send any text to start."
+                        "chat_id": uid, "text": f"✅ You have been added. Send any text to start."
                     }, timeout=3)
                 except Exception:
                     pass
             except Exception:
                 logger.exception("Auto-add allowed user error for %s", bot_id)
+
+# ============================================================================
+# BOT VALIDATION HELPER (FIX for KeyError)
+# ============================================================================
+def is_bot_valid(bot_id: str) -> bool:
+    """Check if a bot is properly initialized before accessing its resources"""
+    return (bot_id in ACTIVE_BOTS and 
+            bot_id in DB_CONNECTIONS and 
+            DB_CONNECTIONS[bot_id] is not None)
 
 # ============================================================================
 # REQUESTS SESSION CONFIGURATION (SHARED)
@@ -411,10 +426,13 @@ class TokenBucket:
             self.cond.notify_all()
 
 TOKEN_BUCKETS: Dict[str, TokenBucket] = {}
-for bot_id, config in ACTIVE_BOTS.items():
-    TOKEN_BUCKETS[bot_id] = TokenBucket(config["max_msg_per_second"])
+for bot_id in ACTIVE_BOTS.keys():
+    TOKEN_BUCKETS[bot_id] = TokenBucket(ACTIVE_BOTS[bot_id]["max_msg_per_second"])
 
 def acquire_token(bot_id: str, timeout=10.0):
+    if bot_id not in TOKEN_BUCKETS:
+        logger.error(f"Token bucket not found for {bot_id}")
+        return False
     return TOKEN_BUCKETS[bot_id].acquire(timeout=timeout)
 
 # ============================================================================
@@ -460,6 +478,10 @@ def is_permanent_telegram_error(code: int, description: str = "") -> bool:
     return False
 
 def record_failure_for_bot(bot_id: str, user_id: int, inc: int = 1, error_code: int = None, description: str = "", is_permanent: bool = False):
+    if not is_bot_valid(bot_id):
+        logger.error(f"Cannot record failure for invalid bot: {bot_id}")
+        return
+    
     try:
         with DB_LOCKS[bot_id]:
             c = DB_CONNECTIONS[bot_id].cursor()
@@ -497,6 +519,9 @@ def record_failure_for_bot(bot_id: str, user_id: int, inc: int = 1, error_code: 
         logger.exception("record_failure error for %s in %s", user_id, bot_id)
 
 def reset_failures_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return
+    
     try:
         with DB_LOCKS[bot_id]:
             c = DB_CONNECTIONS[bot_id].cursor()
@@ -506,6 +531,10 @@ def reset_failures_for_bot(bot_id: str, user_id: int):
         logger.exception("reset_failures failed for %s in %s", user_id, bot_id)
 
 def send_message(bot_id: str, chat_id: int, text: str, reply_markup: Optional[Dict] = None):
+    if not is_bot_valid(bot_id):
+        logger.error(f"Cannot send message from invalid bot: {bot_id}")
+        return None
+    
     config = ACTIVE_BOTS[bot_id]
     telegram_api = get_telegram_api(bot_id)
     
@@ -616,6 +645,9 @@ def send_message(bot_id: str, chat_id: int, text: str, reply_markup: Optional[Di
         time.sleep(backoff_base * (2 ** (attempt - 1)))
 
 def mark_user_permanently_unreachable_for_bot(bot_id: str, user_id: int, error_code: int = None, description: str = ""):
+    if not is_bot_valid(bot_id):
+        return
+    
     try:
         config = ACTIVE_BOTS[bot_id]
         
@@ -657,6 +689,9 @@ def get_message_interval(bot_id: str, total_words: int) -> float:
         return 0.5 if total <= 150 else (0.6 if total <= 300 else 0.7)
 
 def enqueue_task_for_bot(bot_id: str, user_id: int, username: str, text: str):
+    if not is_bot_valid(bot_id):
+        return {"ok": False, "reason": "bot_not_initialized"}
+    
     config = ACTIVE_BOTS[bot_id]
     words = split_text_to_words(text)
     total = len(words)
@@ -679,6 +714,9 @@ def enqueue_task_for_bot(bot_id: str, user_id: int, username: str, text: str):
     return {"ok": True, "total_words": total, "queue_size": pending + 1}
 
 def get_next_task_for_user_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return None
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT id, words_json, total_words, text, retry_count FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
@@ -688,6 +726,9 @@ def get_next_task_for_user_for_bot(bot_id: str, user_id: int):
     return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), "total_words": r[2], "text": r[3], "retry_count": r[4]}
 
 def set_task_status_for_bot(bot_id: str, task_id: int, status: str):
+    if not is_bot_valid(bot_id):
+        return
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         if status == "running":
@@ -699,18 +740,27 @@ def set_task_status_for_bot(bot_id: str, task_id: int, status: str):
         DB_CONNECTIONS[bot_id].commit()
 
 def update_task_activity_for_bot(bot_id: str, task_id: int):
+    if not is_bot_valid(bot_id):
+        return
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("UPDATE tasks SET last_activity = ? WHERE id = ?", (now_ts(), task_id))
         DB_CONNECTIONS[bot_id].commit()
 
 def increment_task_retry_for_bot(bot_id: str, task_id: int):
+    if not is_bot_valid(bot_id):
+        return
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("UPDATE tasks SET retry_count = retry_count + 1, last_activity = ? WHERE id = ?", (now_ts(), task_id))
         DB_CONNECTIONS[bot_id].commit()
 
 def cancel_active_task_for_user_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return 0
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT id FROM tasks WHERE user_id = ? AND status IN ('queued','running','paused')", (user_id,))
@@ -725,6 +775,9 @@ def cancel_active_task_for_user_for_bot(bot_id: str, user_id: int):
     return count
 
 def record_split_log_for_bot(bot_id: str, user_id: int, username: str, count: int = 1):
+    if not is_bot_valid(bot_id):
+        return
+    
     try:
         with DB_LOCKS[bot_id]:
             c = DB_CONNECTIONS[bot_id].cursor()
@@ -739,15 +792,22 @@ def record_split_log_for_bot(bot_id: str, user_id: int, username: str, count: in
 # USER MANAGEMENT (PER-BOT)
 # ============================================================================
 def is_allowed_for_bot(bot_id: str, user_id: int) -> bool:
+    if not is_bot_valid(bot_id):
+        return False
+    
     config = ACTIVE_BOTS[bot_id]
     if user_id in config["owner_ids"]:
         return True
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
         return bool(c.fetchone())
 
 def suspend_user_for_bot(bot_id: str, target_id: int, seconds: int, reason: str = ""):
+    if not is_bot_valid(bot_id):
+        return
+    
     config = ACTIVE_BOTS[bot_id]
     until_utc_str = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
     until_wat_str = utc_to_wat_ts(until_utc_str)
@@ -762,12 +822,15 @@ def suspend_user_for_bot(bot_id: str, target_id: int, seconds: int, reason: str 
     stopped = cancel_active_task_for_user_for_bot(bot_id, target_id)
     try:
         reason_text = f"\nReason: {reason}" if reason else ""
-        send_message(bot_id, target_id, f"⛔ You have been suspended from {bot_id} until {until_wat_str} by {config['owner_tag']}.{reason_text}")
+        send_message(bot_id, target_id, f"⛔ You have been suspended until {until_wat_str} by {config['owner_tag']}.{reason_text}")
     except Exception:
         logger.exception("notify suspended user failed for %s", bot_id)
-    notify_owners_for_bot(bot_id, f"🔒 User suspended in {bot_id}: {label_for_owner_view(bot_id, target_id, fetch_display_username_for_bot(bot_id, target_id))} suspended_until={until_wat_str} reason={reason}")
+    notify_owners_for_bot(bot_id, f"🔒 User suspended: {label_for_owner_view(bot_id, target_id, fetch_display_username_for_bot(bot_id, target_id))} suspended_until={until_wat_str} reason={reason}")
 
 def unsuspend_user_for_bot(bot_id: str, target_id: int) -> bool:
+    if not is_bot_valid(bot_id):
+        return False
+    
     config = ACTIVE_BOTS[bot_id]
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
@@ -778,22 +841,29 @@ def unsuspend_user_for_bot(bot_id: str, target_id: int) -> bool:
         c.execute("DELETE FROM suspended_users WHERE user_id = ?", (target_id,))
         DB_CONNECTIONS[bot_id].commit()
     try:
-        send_message(bot_id, target_id, f"✅ You have been unsuspended from {bot_id} by {config['owner_tag']}.")
+        send_message(bot_id, target_id, f"✅ You have been unsuspended by {config['owner_tag']}.")
     except Exception:
         logger.exception("notify unsuspended failed for %s", bot_id)
-    notify_owners_for_bot(bot_id, f"🔓 Manual unsuspend in {bot_id}: {label_for_owner_view(bot_id, target_id, fetch_display_username_for_bot(bot_id, target_id))}")
+    notify_owners_for_bot(bot_id, f"🔓 Manual unsuspend: {label_for_owner_view(bot_id, target_id, fetch_display_username_for_bot(bot_id, target_id))}")
     return True
 
 def list_suspended_for_bot(bot_id: str):
+    if not is_bot_valid(bot_id):
+        return []
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT user_id, suspended_until, reason, added_at FROM suspended_users ORDER BY suspended_until ASC")
         return c.fetchall()
 
 def is_suspended_for_bot(bot_id: str, user_id: int) -> bool:
+    if not is_bot_valid(bot_id):
+        return False
+    
     config = ACTIVE_BOTS[bot_id]
     if user_id in config["owner_ids"]:
         return False
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (user_id,))
@@ -807,6 +877,9 @@ def is_suspended_for_bot(bot_id: str, user_id: int) -> bool:
         return False
 
 def notify_owners_for_bot(bot_id: str, text: str):
+    if not is_bot_valid(bot_id):
+        return
+    
     config = ACTIVE_BOTS[bot_id]
     for oid in config["owner_ids"]:
         try:
@@ -815,19 +888,27 @@ def notify_owners_for_bot(bot_id: str, text: str):
             logger.exception("notify owner failed for %s in %s", oid, bot_id)
 
 # ============================================================================
-# WORKER MANAGEMENT (PER-BOT)
+# WORKER MANAGEMENT (PER-BOT) - FIXED INITIALIZATION
 # ============================================================================
 _user_workers: Dict[str, Dict[int, Dict[str, Any]]] = {}  # bot_id -> user_id -> worker info
 _user_workers_locks: Dict[str, threading.Lock] = {}
 _active_workers_semaphores: Dict[str, threading.Semaphore] = {}
 
-# Initialize per-bot worker structures
-for bot_id in ACTIVE_BOTS.keys():
+# Initialize ALL dictionaries for ALL configured bots first (FIX for KeyError)
+for bot_id in BOT_CONFIGS.keys():
     _user_workers[bot_id] = {}
     _user_workers_locks[bot_id] = threading.Lock()
+    # Initialize with default value, will be updated for active bots
+    _active_workers_semaphores[bot_id] = threading.Semaphore(25)  # Default
+
+# Now update semaphores for ACTIVE bots with their actual config
+for bot_id in ACTIVE_BOTS.keys():
     _active_workers_semaphores[bot_id] = threading.Semaphore(ACTIVE_BOTS[bot_id]["max_concurrent_workers"])
 
 def notify_user_worker_for_bot(bot_id: str, user_id: int):
+    if bot_id not in _user_workers_locks:
+        return
+    
     with _user_workers_locks[bot_id]:
         info = _user_workers[bot_id].get(user_id)
         if info and "wake" in info:
@@ -837,6 +918,9 @@ def notify_user_worker_for_bot(bot_id: str, user_id: int):
                 pass
 
 def start_user_worker_if_needed_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return
+    
     with _user_workers_locks[bot_id]:
         info = _user_workers[bot_id].get(user_id)
         if info:
@@ -851,6 +935,9 @@ def start_user_worker_if_needed_for_bot(bot_id: str, user_id: int):
         logger.info("Started worker for user %s in %s", user_id, bot_id)
 
 def stop_user_worker_for_bot(bot_id: str, user_id: int, join_timeout: float = 0.5):
+    if bot_id not in _user_workers_locks:
+        return
+    
     with _user_workers_locks[bot_id]:
         info = _user_workers[bot_id].get(user_id)
         if not info:
@@ -868,12 +955,19 @@ def stop_user_worker_for_bot(bot_id: str, user_id: int, join_timeout: float = 0.
             logger.info("Stopped worker for user %s in %s", user_id, bot_id)
 
 def stop_all_workers_for_bot(bot_id: str):
+    if bot_id not in _user_workers_locks:
+        return
+    
     with _user_workers_locks[bot_id]:
         user_ids = list(_user_workers[bot_id].keys())
     for uid in user_ids:
         stop_user_worker_for_bot(bot_id, uid, join_timeout=1.0)
 
 def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threading.Event, stop_event: threading.Event):
+    if not is_bot_valid(bot_id):
+        logger.error("Worker loop cannot start for invalid bot: %s", bot_id)
+        return
+    
     logger.info("Worker loop starting for user %s in %s", user_id, bot_id)
     acquired_semaphore = False
     try:
@@ -882,7 +976,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
             if is_suspended_for_bot(bot_id, user_id):
                 cancel_active_task_for_user_for_bot(bot_id, user_id)
                 try:
-                    send_message(bot_id, user_id, f"⛔ You have been suspended from {bot_id}; stopping your task.")
+                    send_message(bot_id, user_id, f"⛔ You have been suspended; stopping your task.")
                 except Exception:
                     pass
                 while is_suspended_for_bot(bot_id, user_id) and not stop_event.is_set():
@@ -940,7 +1034,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
 
             if retry_count > 0:
                 try:
-                    send_message(bot_id, user_id, f"🔄 {bot_id}: Retrying your task (attempt {retry_count + 1})...")
+                    send_message(bot_id, user_id, f"🔄 Retrying your task (attempt {retry_count + 1})...")
                 except Exception:
                     pass
 
@@ -948,7 +1042,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
             est_seconds = int((total - sent) * interval)
             est_str = str(timedelta(seconds=est_seconds))
             try:
-                send_message(bot_id, user_id, f"🚀 {bot_id}: Starting your split now. Words: {total}. Estimated time: {est_str}")
+                send_message(bot_id, user_id, f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}")
             except Exception:
                 pass
 
@@ -974,7 +1068,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
 
                 if status == "paused":
                     try:
-                        send_message(bot_id, user_id, f"⏸️ {bot_id}: Task paused…")
+                        send_message(bot_id, user_id, f"⏸️ Task paused…")
                     except Exception:
                         pass
                     while True:
@@ -990,7 +1084,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
                             break
                         if row2[0] == "running":
                             try:
-                                send_message(bot_id, user_id, f"▶️ {bot_id}: Resuming your task now.")
+                                send_message(bot_id, user_id, "▶️ Resuming your task now.")
                             except Exception:
                                 pass
                             last_send_time = time.monotonic()
@@ -1000,7 +1094,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
                         if is_suspended_for_bot(bot_id, user_id):
                             set_task_status_for_bot(bot_id, task_id, "cancelled")
                             try: 
-                                send_message(bot_id, user_id, f"⛔ {bot_id}: You have been suspended; stopping your task.")
+                                send_message(bot_id, user_id, "⛔ You have been suspended; stopping your task.")
                             except Exception: 
                                 pass
                         break
@@ -1018,7 +1112,7 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
                             logger.error(f"Too many consecutive errors ({consecutive_errors}) for user {user_id} in {bot_id}. Pausing task.")
                             set_task_status_for_bot(bot_id, task_id, "paused")
                             try:
-                                send_message(bot_id, user_id, f"⚠️ {bot_id}: Task paused due to sending errors. Will retry in 30 seconds.")
+                                send_message(bot_id, user_id, f"⚠️ Task paused due to sending errors. Will retry in 30 seconds.")
                             except Exception:
                                 pass
                             time.sleep(30)
@@ -1065,12 +1159,12 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
             if final_status not in ("cancelled", "paused"):
                 set_task_status_for_bot(bot_id, task_id, "done")
                 try:
-                    send_message(bot_id, user_id, f"✅ {bot_id}: All done!")
+                    send_message(bot_id, user_id, f"✅ All done!")
                 except Exception:
                     pass
             elif final_status == "cancelled":
                 try:
-                    send_message(bot_id, user_id, f"🛑 {bot_id}: Task stopped.")
+                    send_message(bot_id, user_id, f"🛑 Task stopped.")
                 except Exception:
                     pass
 
@@ -1094,9 +1188,12 @@ def per_user_worker_loop_for_bot(bot_id: str, user_id: int, wake_event: threadin
         logger.info("Worker loop exiting for user %s in %s", user_id, bot_id)
 
 # ============================================================================
-# STATISTICS & UTILITIES (PER-BOT)
+# STATISTICS & UTILITIES (PER-BOT) - WITH FIXED ERROR HANDLING
 # ============================================================================
 def fetch_display_username_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return ""
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT username FROM split_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
@@ -1110,6 +1207,11 @@ def fetch_display_username_for_bot(bot_id: str, user_id: int):
     return ""
 
 def compute_last_hour_stats_for_bot(bot_id: str):
+    # FIX: Check if bot is valid before accessing DB_LOCKS
+    if not is_bot_valid(bot_id):
+        logger.debug(f"Bot {bot_id} not valid, skipping stats")
+        return []
+    
     cutoff = datetime.utcnow() - timedelta(hours=1)
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
@@ -1127,6 +1229,9 @@ def compute_last_hour_stats_for_bot(bot_id: str):
     return [(k, v["uname"], v["words"]) for k, v in stat_map.items()]
 
 def compute_last_12h_stats_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return 0
+    
     cutoff = datetime.utcnow() - timedelta(hours=12)
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
@@ -1137,11 +1242,16 @@ def compute_last_12h_stats_for_bot(bot_id: str, user_id: int):
         return int(r[0] or 0)
 
 def send_hourly_owner_stats_for_bot(bot_id: str):
+    # FIX: Check if bot is valid
+    if not is_bot_valid(bot_id):
+        logger.debug(f"Bot {bot_id} not valid, skipping hourly stats")
+        return
+    
     rows = compute_last_hour_stats_for_bot(bot_id)
     config = ACTIVE_BOTS[bot_id]
     
     if not rows:
-        msg = f"📊 {bot_id} Hourly Report: no splits in the last hour."
+        msg = "📊 Hourly Report: no splits in the last hour."
         for oid in config["owner_ids"]:
             try:
                 send_message(bot_id, oid, msg)
@@ -1153,7 +1263,7 @@ def send_hourly_owner_stats_for_bot(bot_id: str):
     for uid, uname, w in rows:
         uname_for_stat = at_username(uname) if uname else fetch_display_username_for_bot(bot_id, uid)
         lines.append(f"{uid} ({uname_for_stat}) - {w} words sent")
-    body = f"📊 {bot_id} Report - last 1h:\n" + "\n".join(lines)
+    body = "📊 Report - last 1h:\n" + "\n".join(lines)
     
     for oid in config["owner_ids"]:
         try:
@@ -1162,6 +1272,11 @@ def send_hourly_owner_stats_for_bot(bot_id: str):
             pass
 
 def check_and_lift_for_bot(bot_id: str):
+    # FIX: Check if bot is valid
+    if not is_bot_valid(bot_id):
+        logger.debug(f"Bot {bot_id} not valid, skipping check_and_lift")
+        return
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT user_id, suspended_until FROM suspended_users")
@@ -1177,6 +1292,11 @@ def check_and_lift_for_bot(bot_id: str):
             logger.exception("suspend parse error for %s in %s", r, bot_id)
 
 def prune_old_logs_for_bot(bot_id: str):
+    # FIX: Check if bot is valid
+    if not is_bot_valid(bot_id):
+        logger.debug(f"Bot {bot_id} not valid, skipping prune_old_logs")
+        return
+    
     try:
         config = ACTIVE_BOTS[bot_id]
         cutoff = (datetime.utcnow() - timedelta(days=config["log_retention_days"])).strftime("%Y-%m-%d %H:%M:%S")
@@ -1193,6 +1313,11 @@ def prune_old_logs_for_bot(bot_id: str):
         logger.exception("prune_old_logs error for %s", bot_id)
 
 def check_stuck_tasks_for_bot(bot_id: str):
+    # FIX: Check if bot is valid
+    if not is_bot_valid(bot_id):
+        logger.debug(f"Bot {bot_id} not valid, skipping check_stuck_tasks")
+        return
+    
     try:
         cutoff = (datetime.utcnow() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
         with DB_LOCKS[bot_id]:
@@ -1211,7 +1336,7 @@ def check_stuck_tasks_for_bot(bot_id: str):
                     c.execute("UPDATE tasks SET status = 'cancelled', finished_at = ? WHERE id = ?", (now_ts(), task_id))
                     logger.info(f"Cancelled stuck task {task_id} in {bot_id} after {retry_count} retries")
                     try:
-                        send_message(bot_id, user_id, f"🛑 Your task in {bot_id} was cancelled after multiple failures. Please try again.")
+                        send_message(bot_id, user_id, f"🛑 Your task was cancelled after multiple failures. Please try again.")
                     except Exception:
                         pass
             
@@ -1222,6 +1347,9 @@ def check_stuck_tasks_for_bot(bot_id: str):
         logger.exception("Error checking for stuck tasks in %s", bot_id)
 
 def get_user_task_counts_for_bot(bot_id: str, user_id: int):
+    if not is_bot_valid(bot_id):
+        return 0, 0
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,))
@@ -1231,11 +1359,12 @@ def get_user_task_counts_for_bot(bot_id: str, user_id: int):
     return active, queued
 
 # ============================================================================
-# SCHEDULER SETUP (PER-BOT JOBS)
+# SCHEDULER SETUP (PER-BOT JOBS) - FIXED: ONLY FOR ACTIVE BOTS
 # ============================================================================
 scheduler = BackgroundScheduler()
 
-for bot_id in ACTIVE_BOTS.keys():
+# CRITICAL FIX: Only schedule jobs for ACTIVE bots (bots with tokens)
+for bot_id in ACTIVE_BOTS.keys():  # CHANGED FROM BOT_CONFIGS.keys()
     # Hourly stats for each bot
     scheduler.add_job(
         lambda b=bot_id: send_hourly_owner_stats_for_bot(b),
@@ -1275,12 +1404,13 @@ for bot_id in ACTIVE_BOTS.keys():
 scheduler.start()
 
 # ============================================================================
-# OWNER OPERATIONS (PER-BOT)
+# OWNER OPERATIONS (PER-BOT) - FIXED INITIALIZATION
 # ============================================================================
 _owner_ops_locks: Dict[str, threading.Lock] = {}
 _owner_ops_states: Dict[str, Dict[int, Dict]] = {}
 
-for bot_id in ACTIVE_BOTS.keys():
+# Initialize ALL dictionaries for ALL configured bots first
+for bot_id in BOT_CONFIGS.keys():
     _owner_ops_locks[bot_id] = threading.Lock()
     _owner_ops_states[bot_id] = {}
 
@@ -1301,6 +1431,9 @@ def is_owner_in_operation_for_bot(bot_id: str, user_id: int) -> bool:
         return user_id in _owner_ops_states[bot_id]
 
 def get_user_tasks_preview_for_bot(bot_id: str, user_id: int, hours: int, page: int = 0) -> Tuple[List[Dict], int, int]:
+    if not is_bot_valid(bot_id):
+        return [], 0, 0
+    
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
@@ -1336,6 +1469,9 @@ def get_user_tasks_preview_for_bot(bot_id: str, user_id: int, hours: int, page: 
     return paginated_tasks, total_tasks, total_pages
 
 def get_all_users_ordered_for_bot(bot_id: str):
+    if not is_bot_valid(bot_id):
+        return []
+    
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
         c.execute("SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC")
@@ -1390,8 +1526,11 @@ def parse_duration(duration_str: str) -> Tuple[int, str]:
     return total_seconds, formatted
 
 def send_ownersets_menu_for_bot(bot_id: str, owner_id: int):
+    if not is_bot_valid(bot_id):
+        return
+    
     config = ACTIVE_BOTS[bot_id]
-    menu_text = f"👑 {bot_id} Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
+    menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
     
     keyboard = [
         [{"text": "📊 Bot Info", "callback_data": f"owner_botinfo_{bot_id}"}, 
@@ -1411,7 +1550,7 @@ def send_ownersets_menu_for_bot(bot_id: str, owner_id: int):
 # ============================================================================
 @app.route("/webhook/<bot_id>", methods=["POST"])
 def webhook_handler(bot_id: str):
-    if bot_id not in ACTIVE_BOTS:
+    if bot_id not in BOT_CONFIGS:
         logger.warning("Unknown bot ID in webhook: %s", bot_id)
         return jsonify({"ok": False, "error": "bot_not_found"}), 404
     
@@ -1439,13 +1578,15 @@ def handle_callback_query(bot_id: str, callback):
     uid = user.get("id")
     data = callback.get("data", "")
     
-    config = ACTIVE_BOTS[bot_id]
-    if uid not in config["owner_ids"]:
+    config = ACTIVE_BOTS.get(bot_id)
+    if not config or uid not in config["owner_ids"]:
         try:
-            _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
-                "callback_query_id": callback.get("id"),
-                "text": f"⛔ {bot_id} owner only."
-            }, timeout=2)
+            telegram_api = get_telegram_api(bot_id)
+            if telegram_api:
+                _session.post(f"{telegram_api}/answerCallbackQuery", json={
+                    "callback_query_id": callback.get("id"),
+                    "text": "⛔ Owner only."
+                }, timeout=2)
         except Exception:
             pass
         return jsonify({"ok": True})
@@ -1468,7 +1609,7 @@ def handle_callback_query(bot_id: str, callback):
         try:
             _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
                 "callback_query_id": callback.get("id"),
-                "text": f"✅ {bot_id} menu closed."
+                "text": "✅ Menu closed."
             }, timeout=2)
         except Exception:
             pass
@@ -1496,7 +1637,7 @@ def handle_callback_query(bot_id: str, callback):
         try:
             _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
                 "callback_query_id": callback.get("id"),
-                "text": f"✅ Returning to {bot_id} menu."
+                "text": "✅ Returning to menu."
             }, timeout=2)
         except Exception:
             pass
@@ -1511,10 +1652,10 @@ def handle_callback_query(bot_id: str, callback):
         set_owner_state_for_bot(bot_id, uid, {"operation": operation, "step": 0})
         
         prompts = {
-            "adduser": f"👤 {bot_id}: Please send the User ID to add (multiple IDs separated by spaces/commas):",
-            "suspend": f"⏸️ {bot_id}: Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s)\n3. Optional reason\n\nExamples:\n• 123456789 30s Too many requests\n• 123456789 1d2h Spamming\n• 123456789 2h30m Violation",
-            "unsuspend": f"▶️ {bot_id}: Please send the User ID to unsuspend:",
-            "checkallpreview": f"⏰ {bot_id}: How many hours back should I check? (e.g., 1, 6, 24, 168):"
+            "adduser": "👤 Please send the User ID to add (multiple IDs separated by spaces/commas):",
+            "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s)\n3. Optional reason\n\nExamples:\n• 123456789 30s Too many requests\n• 123456789 1d2h Spamming\n• 123456789 2h30m Violation",
+            "unsuspend": "▶️ Please send the User ID to unsuspend:",
+            "checkallpreview": "⏰ How many hours back should I check? (e.g., 1, 6, 24, 168):"
         }
         
         cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"owner_cancelinput_{bot_id}"}]]}
@@ -1526,7 +1667,7 @@ def handle_callback_query(bot_id: str, callback):
         try:
             _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
                 "callback_query_id": callback.get("id"),
-                "text": f"ℹ️ Please check your new {bot_id} message."
+                "text": "ℹ️ Please check your new message."
             }, timeout=2)
         except Exception:
             pass
@@ -1544,7 +1685,7 @@ def handle_callback_query(bot_id: str, callback):
         try:
             _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
                 "callback_query_id": callback.get("id"),
-                "text": f"❌ {bot_id} operation cancelled."
+                "text": "❌ Operation cancelled."
             }, timeout=2)
         except Exception:
             pass
@@ -1561,6 +1702,9 @@ def handle_callback_query(bot_id: str, callback):
     return jsonify({"ok": True})
 
 def handle_owner_botinfo(bot_id: str, callback, uid: int):
+    if not is_bot_valid(bot_id):
+        return jsonify({"ok": True})
+    
     config = ACTIVE_BOTS[bot_id]
     active_rows, queued_tasks = [], 0
     with DB_LOCKS[bot_id]:
@@ -1601,18 +1745,19 @@ def handle_owner_botinfo(bot_id: str, callback, uid: int):
         c.execute("SELECT COUNT(*) FROM suspended_users")
         total_suspended = c.fetchone()[0]
     
+    interval_type = "SLOW" if config["use_slow_interval"] else "FAST"
     body = (
-        f"🤖 {bot_id} Status\n"
+        f"🤖 Bot Status\n"
         f"👥 Allowed users: {total_allowed}\n"
         f"🚫 Suspended users: {total_suspended}\n"
         f"⚙️ Active tasks: {len(active_rows)}\n"
         f"📨 Queued tasks: {queued_tasks}\n"
-        f"⏱️ Interval: {'SLOW' if config['use_slow_interval'] else 'FAST'}\n\n"
+        f"⏱️ Interval: {interval_type}\n\n"
         "Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
         "User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
     )
     
-    menu_text = f"👑 {bot_id} Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
+    menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
     keyboard = [
         [{"text": "📊 Bot Info", "callback_data": f"owner_botinfo_{bot_id}"}, 
          {"text": "👥 List Users", "callback_data": f"owner_listusers_{bot_id}"}],
@@ -1635,7 +1780,7 @@ def handle_owner_botinfo(bot_id: str, callback, uid: int):
     try:
         _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
             "callback_query_id": callback.get("id"),
-            "text": f"✅ {bot_id} info loaded."
+            "text": "✅ Bot info loaded."
         }, timeout=2)
     except Exception:
         pass
@@ -1643,6 +1788,9 @@ def handle_owner_botinfo(bot_id: str, callback, uid: int):
     return jsonify({"ok": True})
 
 def handle_owner_listusers(bot_id: str, callback, uid: int):
+    if not is_bot_valid(bot_id):
+        return jsonify({"ok": True})
+    
     config = ACTIVE_BOTS[bot_id]
     with DB_LOCKS[bot_id]:
         c = DB_CONNECTIONS[bot_id].cursor()
@@ -1656,9 +1804,9 @@ def handle_owner_listusers(bot_id: str, callback, uid: int):
         added_at_wat = utc_to_wat_ts(added_at_utc)
         lines.append(f"{uid2} {uname_s} added={added_at_wat}")
     
-    body = f"👥 {bot_id} Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
+    body = "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
     
-    menu_text = f"👑 {bot_id} Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
+    menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
     keyboard = [
         [{"text": "📊 Bot Info", "callback_data": f"owner_botinfo_{bot_id}"}, 
          {"text": "👥 List Users", "callback_data": f"owner_listusers_{bot_id}"}],
@@ -1681,7 +1829,7 @@ def handle_owner_listusers(bot_id: str, callback, uid: int):
     try:
         _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
             "callback_query_id": callback.get("id"),
-            "text": f"✅ {bot_id} user list loaded."
+            "text": "✅ User list loaded."
         }, timeout=2)
     except Exception:
         pass
@@ -1689,6 +1837,9 @@ def handle_owner_listusers(bot_id: str, callback, uid: int):
     return jsonify({"ok": True})
 
 def handle_owner_listsuspended(bot_id: str, callback, uid: int):
+    if not is_bot_valid(bot_id):
+        return jsonify({"ok": True})
+    
     config = ACTIVE_BOTS[bot_id]
     for row in list_suspended_for_bot(bot_id)[:]:
         uid2, until_utc, reason, added_at_utc = row
@@ -1698,7 +1849,7 @@ def handle_owner_listsuspended(bot_id: str, callback, uid: int):
     
     rows = list_suspended_for_bot(bot_id)
     if not rows:
-        body = f"✅ {bot_id}: No suspended users."
+        body = "✅ No suspended users."
     else:
         lines = []
         for r in rows:
@@ -1708,9 +1859,9 @@ def handle_owner_listsuspended(bot_id: str, callback, uid: int):
             uname = fetch_display_username_for_bot(bot_id, uid2)
             uname_s = f"({at_username(uname)})" if uname else ""
             lines.append(f"{uid2} {uname_s} until={until_wat} reason={reason}")
-        body = f"🚫 {bot_id} Suspended users:\n" + "\n".join(lines)
+        body = "🚫 Suspended users:\n" + "\n".join(lines)
     
-    menu_text = f"👑 {bot_id} Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
+    menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
     keyboard = [
         [{"text": "📊 Bot Info", "callback_data": f"owner_botinfo_{bot_id}"}, 
          {"text": "👥 List Users", "callback_data": f"owner_listusers_{bot_id}"}],
@@ -1733,7 +1884,7 @@ def handle_owner_listsuspended(bot_id: str, callback, uid: int):
     try:
         _session.post(f"{get_telegram_api(bot_id)}/answerCallbackQuery", json={
             "callback_query_id": callback.get("id"),
-            "text": f"✅ {bot_id} suspended list loaded."
+            "text": "✅ Suspended list loaded."
         }, timeout=2)
     except Exception:
         pass
@@ -1741,6 +1892,9 @@ def handle_owner_listsuspended(bot_id: str, callback, uid: int):
     return jsonify({"ok": True})
 
 def handle_owner_checkallpreview(bot_id: str, callback, uid: int, parts):
+    if not is_bot_valid(bot_id):
+        return jsonify({"ok": True})
+    
     if len(parts) == 5:  # owner_checkallpreview_userid_page_hours
         target_user = int(parts[2])
         page = int(parts[3])
@@ -1756,7 +1910,7 @@ def handle_owner_checkallpreview(bot_id: str, callback, uid: int, parts):
                     _session.post(f"{get_telegram_api(bot_id)}/editMessageText", json={
                         "chat_id": callback["message"]["chat"]["id"],
                         "message_id": callback["message"]["message_id"],
-                        "text": f"📋 {bot_id}: No users found.",
+                        "text": "📋 No users found.",
                     }, timeout=2)
                 except Exception:
                     pass
@@ -1770,13 +1924,13 @@ def handle_owner_checkallpreview(bot_id: str, callback, uid: int, parts):
         added_wat = utc_to_wat_ts(added_at_info)
         
         if not tasks:
-            body = f"👤 {bot_id} User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
+            body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
         else:
             lines = []
             for task in tasks:
                 lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
             
-            body = f"👤 {bot_id} User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
+            body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
         
         keyboard = []
         
@@ -1817,6 +1971,10 @@ def handle_owner_checkallpreview(bot_id: str, callback, uid: int, parts):
     return jsonify({"ok": True})
 
 def handle_message(bot_id: str, msg):
+    config = ACTIVE_BOTS.get(bot_id)
+    if not config:
+        return jsonify({"ok": True})
+    
     user = msg.get("from", {})
     uid = user.get("id")
     username = user.get("username") or (user.get("first_name") or "")
@@ -1832,7 +1990,6 @@ def handle_message(bot_id: str, msg):
         logger.exception("webhook: update allowed_users username failed for %s", bot_id)
 
     # Check if owner is in input mode for THIS bot
-    config = ACTIVE_BOTS[bot_id]
     if uid in config["owner_ids"] and is_owner_in_operation_for_bot(bot_id, uid):
         state = get_owner_state_for_bot(bot_id, uid)
         if state:
@@ -1859,7 +2016,7 @@ def handle_message(bot_id: str, msg):
                         DB_CONNECTIONS[bot_id].commit()
                     added.append(tid)
                     try:
-                        send_message(bot_id, tid, f"✅ You have been added to {bot_id}. Send any text to start.")
+                        send_message(bot_id, tid, f"✅ You have been added. Send any text to start.")
                     except Exception:
                         pass
                 parts_msgs = []
@@ -1869,19 +2026,19 @@ def handle_message(bot_id: str, msg):
                 result_msg = "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes")
                 
                 clear_owner_state_for_bot(bot_id, uid)
-                send_message(bot_id, uid, f"{result_msg}\n\nUse /ownersets again to access the {bot_id} menu. 😊")
+                send_message(bot_id, uid, f"{result_msg}\n\nUse /ownersets again to access the menu. 😊")
                 return jsonify({"ok": True})
             
             elif operation == "suspend":
                 parts = text.split(maxsplit=2)
                 if len(parts) < 2:
-                    send_message(bot_id, uid, f"⚠️ {bot_id}: Please provide both User ID and duration. Example: 123456789 1d2h")
+                    send_message(bot_id, uid, "⚠️ Please provide both User ID and duration. Example: 123456789 1d2h")
                     return jsonify({"ok": True})
                 
                 try:
                     target = int(parts[0])
                 except Exception:
-                    send_message(bot_id, uid, f"❌ {bot_id}: Invalid User ID. Please try again.")
+                    send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
                     return jsonify({"ok": True})
                 
                 dur = parts[1]
@@ -1889,7 +2046,7 @@ def handle_message(bot_id: str, msg):
                 
                 result = parse_duration(dur)
                 if result[0] is None:
-                    send_message(bot_id, uid, f"❌ {bot_id}: {result[1]}\n\nValid examples: 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s")
+                    send_message(bot_id, uid, f"❌ {result[1]}\n\nValid examples: 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s")
                     return jsonify({"ok": True})
                 
                 seconds, formatted_duration = result
@@ -1899,24 +2056,24 @@ def handle_message(bot_id: str, msg):
                 until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
                 
                 clear_owner_state_for_bot(bot_id, uid)
-                send_message(bot_id, uid, f"✅ {bot_id}: User {label_for_owner_view(bot_id, target, fetch_display_username_for_bot(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the {bot_id} menu. 😊")
+                send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username_for_bot(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
                 return jsonify({"ok": True})
             
             elif operation == "unsuspend":
                 try:
                     target = int(text.strip())
                 except Exception:
-                    send_message(bot_id, uid, f"❌ {bot_id}: Invalid User ID. Please try again.")
+                    send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
                     return jsonify({"ok": True})
                 
                 ok = unsuspend_user_for_bot(bot_id, target)
                 if ok:
-                    result = f"✅ {bot_id}: User {label_for_owner_view(bot_id, target, fetch_display_username_for_bot(bot_id, target))} unsuspended."
+                    result = f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username_for_bot(bot_id, target))} unsuspended."
                 else:
-                    result = f"ℹ️ {bot_id}: User {target} is not suspended."
+                    result = f"ℹ️ User {target} is not suspended."
                 
                 clear_owner_state_for_bot(bot_id, uid)
-                send_message(bot_id, uid, f"{result}\n\nUse /ownersets again to access the {bot_id} menu. 😊")
+                send_message(bot_id, uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
                 return jsonify({"ok": True})
             
             elif operation == "checkallpreview":
@@ -1925,13 +2082,13 @@ def handle_message(bot_id: str, msg):
                     if hours <= 0:
                         raise ValueError
                 except Exception:
-                    send_message(bot_id, uid, f"❌ {bot_id}: Please enter a valid positive number of hours.")
+                    send_message(bot_id, uid, "❌ Please enter a valid positive number of hours.")
                     return jsonify({"ok": True})
                 
                 all_users = get_all_users_ordered_for_bot(bot_id)
                 if not all_users:
                     clear_owner_state_for_bot(bot_id, uid)
-                    send_message(bot_id, uid, f"📋 {bot_id}: No users found.")
+                    send_message(bot_id, uid, "📋 No users found.")
                     return jsonify({"ok": True})
                 
                 first_user_id, first_username, first_added_at = all_users[0]
@@ -1941,13 +2098,13 @@ def handle_message(bot_id: str, msg):
                 tasks, total_tasks, total_pages = get_user_tasks_preview_for_bot(bot_id, first_user_id, hours, 0)
                 
                 if not tasks:
-                    body = f"👤 {bot_id} User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
+                    body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
                 else:
                     lines = []
                     for task in tasks:
                         lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
                     
-                    body = f"👤 {bot_id} User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
+                    body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
                 
                 keyboard = []
                 
@@ -1985,8 +2142,8 @@ def handle_message(bot_id: str, msg):
         # Handle /ownersets command
         if cmd == "/ownersets":
             if uid not in config["owner_ids"]:
-                send_message(bot_id, uid, f"🚫 {bot_id} owner only. {config['owner_tag']} notified.")
-                notify_owners_for_bot(bot_id, f"🚨 Unallowed /ownersets attempt in {bot_id} by {at_username(username) if username else uid} (ID: {uid}).")
+                send_message(bot_id, uid, f"🚫 Owner only. {config['owner_tag']} notified.")
+                notify_owners_for_bot(bot_id, f"🚨 Unallowed /ownersets attempt by {at_username(username) if username else uid} (ID: {uid}).")
                 return jsonify({"ok": True})
             send_ownersets_menu_for_bot(bot_id, uid)
             return jsonify({"ok": True})
@@ -1999,16 +2156,19 @@ def handle_message(bot_id: str, msg):
     return jsonify({"ok": True})
 
 # ============================================================================
-# COMMAND HANDLERS (PER-BOT)
+# COMMAND HANDLERS (PER-BOT) - FIXED: NO BOT ID IN MESSAGES
 # ============================================================================
 def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: str, args: str):
+    if not is_bot_valid(bot_id):
+        return jsonify({"ok": True})
+    
     config = ACTIVE_BOTS[bot_id]
     
     if command == "/start":
         who = label_for_self(bot_id, user_id, username) or "there"
         msg = (
             f"👋 Hi {who}!\n\n"
-            f"I'm {bot_id}. I split your text into individual word messages. ✂️📤\n\n"
+            f"I split your text into individual word messages. ✂️📤\n\n"
             f"{config['owner_tag']} command:\n"
             " /ownersets - Owner management menu\n\n"
             "User commands:\n"
@@ -2021,7 +2181,7 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
     if command == "/about":
         interval_type = "SLOW (1.0-1.2s)" if config["use_slow_interval"] else "FAST (0.5-0.7s)"
         msg = (
-            f"ℹ️ About {bot_id}:\n"
+            f"ℹ️ About:\n"
             "I split texts into single words. ✂️\n\n"
             f"Interval: {interval_type}\n"
             "Features:\n"
@@ -2032,8 +2192,8 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
         return jsonify({"ok": True})
 
     if user_id not in config["owner_ids"] and not is_allowed_for_bot(bot_id, user_id):
-        send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed to use {bot_id}. {config['owner_tag']} notified.\nYour ID: {user_id}")
-        notify_owners_for_bot(bot_id, f"🚨 Unallowed access attempt to {bot_id} by {at_username(username) if username else user_id} (ID: {user_id}).")
+        send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed. {config['owner_tag']} notified.\nYour ID: {user_id}")
+        notify_owners_for_bot(bot_id, f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
         return jsonify({"ok": True})
 
     if command == "/example":
@@ -2044,15 +2204,15 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
         ])
         res = enqueue_task_for_bot(bot_id, user_id, username, sample)
         if not res["ok"]:
-            send_message(bot_id, user_id, f"❗ {bot_id}: Could not queue demo. Try later.")
+            send_message(bot_id, user_id, "❗ Could not queue demo. Try later.")
             return jsonify({"ok": True})
         start_user_worker_if_needed_for_bot(bot_id, user_id)
         notify_user_worker_for_bot(bot_id, user_id)
         active, queued = get_user_task_counts_for_bot(bot_id, user_id)
         if active:
-            send_message(bot_id, user_id, f"✅ {bot_id}: Task added. Words: {res['total_words']}.\nQueue position: {queued}")
+            send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
         else:
-            send_message(bot_id, user_id, f"✅ {bot_id}: Task added. Words: {res['total_words']}.")
+            send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.")
         return jsonify({"ok": True})
 
     if command == "/pause":
@@ -2061,11 +2221,11 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
-            send_message(bot_id, user_id, f"ℹ️ {bot_id}: No active task to pause.")
+            send_message(bot_id, user_id, "ℹ️ No active task to pause.")
             return jsonify({"ok": True})
         set_task_status_for_bot(bot_id, rows[0], "paused")
         notify_user_worker_for_bot(bot_id, user_id)
-        send_message(bot_id, user_id, f"⏸️ {bot_id}: Paused. Use /resume to continue.")
+        send_message(bot_id, user_id, "⏸️ Paused. Use /resume to continue.")
         return jsonify({"ok": True})
 
     if command == "/resume":
@@ -2074,11 +2234,11 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
-            send_message(bot_id, user_id, f"ℹ️ {bot_id}: No paused task to resume.")
+            send_message(bot_id, user_id, "ℹ️ No paused task to resume.")
             return jsonify({"ok": True})
         set_task_status_for_bot(bot_id, rows[0], "running")
         notify_user_worker_for_bot(bot_id, user_id)
-        send_message(bot_id, user_id, f"▶️ {bot_id}: Resuming your task now.")
+        send_message(bot_id, user_id, "▶️ Resuming your task now.")
         return jsonify({"ok": True})
 
     if command == "/status":
@@ -2091,11 +2251,11 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
         if active:
             aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
-            send_message(bot_id, user_id, f"ℹ️ {bot_id} Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
+            send_message(bot_id, user_id, f"ℹ️ Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
         elif queued > 0:
-            send_message(bot_id, user_id, f"⏳ {bot_id}: Waiting. Queue size: {queued}")
+            send_message(bot_id, user_id, f"⏳ Waiting. Queue size: {queued}")
         else:
-            send_message(bot_id, user_id, f"✅ {bot_id}: You have no active or queued tasks.")
+            send_message(bot_id, user_id, "✅ You have no active or queued tasks.")
         return jsonify({"ok": True})
 
     if command == "/stop":
@@ -2106,20 +2266,23 @@ def handle_command_for_bot(bot_id: str, user_id: int, username: str, command: st
         stopped = cancel_active_task_for_user_for_bot(bot_id, user_id)
         stop_user_worker_for_bot(bot_id, user_id)
         if stopped > 0 or queued > 0:
-            send_message(bot_id, user_id, f"🛑 {bot_id}: Active task stopped. Your queued tasks were cleared too.")
+            send_message(bot_id, user_id, "🛑 Active task stopped. Your queued tasks were cleared too.")
         else:
-            send_message(bot_id, user_id, f"ℹ️ {bot_id}: You had no active or queued tasks.")
+            send_message(bot_id, user_id, "ℹ️ You had no active or queued tasks.")
         return jsonify({"ok": True})
 
     if command == "/stats":
         words = compute_last_12h_stats_for_bot(bot_id, user_id)
-        send_message(bot_id, user_id, f"📊 {bot_id} Your last 12 hours: {words} words split")
+        send_message(bot_id, user_id, f"📊 Your last 12 hours: {words} words split")
         return jsonify({"ok": True})
 
-    send_message(bot_id, user_id, f"❓ {bot_id}: Unknown command.")
+    send_message(bot_id, user_id, "❓ Unknown command.")
     return jsonify({"ok": True})
 
 def handle_user_text_for_bot(bot_id: str, user_id: int, username: str, text: str):
+    if not is_bot_valid(bot_id):
+        return jsonify({"ok": True})
+    
     config = ACTIVE_BOTS[bot_id]
     
     # Block owner task processing if in operation mode for THIS bot
@@ -2128,9 +2291,9 @@ def handle_user_text_for_bot(bot_id: str, user_id: int, username: str, text: str
         return jsonify({"ok": True})
     
     if user_id not in config["owner_ids"] and not is_allowed_for_bot(bot_id, user_id):
-        send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed to use {bot_id}. {config['owner_tag']} notified.\nYour ID: {user_id}")
-        notify_owners_for_bot(bot_id, f"🚨 Unallowed access attempt to {bot_id} by {at_username(username) if username else user_id} (ID: {user_id}).")
-        return jsonify({"ok": True})
+        send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed. {config['owner_tag']} notified.\nYour ID: {user_id}")
+        notify_owners_for_bot(bot_id, f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
+        return jsonify({"ok": True}")
     
     if is_suspended_for_bot(bot_id, user_id):
         with DB_LOCKS[bot_id]:
@@ -2139,27 +2302,27 @@ def handle_user_text_for_bot(bot_id: str, user_id: int, username: str, text: str
             r = c.fetchone()
             until_utc = r[0] if r else "unknown"
             until_wat = utc_to_wat_ts(until_utc)
-        send_message(bot_id, user_id, f"⛔ You have been suspended from {bot_id} until {until_wat} by {config['owner_tag']}.")
+        send_message(bot_id, user_id, f"⛔ You have been suspended until {until_wat} by {config['owner_tag']}.")
         return jsonify({"ok": True})
     
     res = enqueue_task_for_bot(bot_id, user_id, username, text)
     if not res["ok"]:
         if res["reason"] == "empty":
-            send_message(bot_id, user_id, f"⚠️ {bot_id}: Empty text. Nothing to split.")
+            send_message(bot_id, user_id, "⚠️ Empty text. Nothing to split.")
             return jsonify({"ok": True})
         if res["reason"] == "queue_full":
-            send_message(bot_id, user_id, f"⏳ {bot_id}: Your queue is full ({res['queue_size']}). Use /stop or wait.")
+            send_message(bot_id, user_id, f"⏳ Your queue is full ({res['queue_size']}). Use /stop or wait.")
             return jsonify({"ok": True})
-        send_message(bot_id, user_id, f"❗ {bot_id}: Could not queue task. Try later.")
+        send_message(bot_id, user_id, "❗ Could not queue task. Try later.")
         return jsonify({"ok": True})
     
     start_user_worker_if_needed_for_bot(bot_id, user_id)
     notify_user_worker_for_bot(bot_id, user_id)
     active, queued = get_user_task_counts_for_bot(bot_id, user_id)
     if active:
-        send_message(bot_id, user_id, f"✅ {bot_id}: Task added. Words: {res['total_words']}.\nQueue position: {queued}")
+        send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
     else:
-        send_message(bot_id, user_id, f"✅ {bot_id}: Task added. Words: {res['total_words']}.")
+        send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.")
     return jsonify({"ok": True})
 
 # ============================================================================
@@ -2172,28 +2335,27 @@ def root():
 
 @app.route("/health/<bot_id>", methods=["GET", "HEAD"])
 def health_bot(bot_id: str):
-    if bot_id not in ACTIVE_BOTS:
+    if bot_id not in BOT_CONFIGS:
         return jsonify({"ok": False, "error": "bot_not_found"}), 404
     
+    is_active = bot_id in ACTIVE_BOTS
     status = {
-        "ok": True,
+        "ok": is_active and is_bot_valid(bot_id),
         "bot_id": bot_id,
+        "active": is_active,
         "timestamp": now_ts(),
-        "configured": True,
-        "db_connected": DB_CONNECTIONS.get(bot_id) is not None,
+        "configured": bot_id in BOT_CONFIGS,
+        "db_connected": is_bot_valid(bot_id),
         "workers_active": len(_user_workers.get(bot_id, {})),
-        "config": {
+    }
+    
+    if is_active:
+        status["config"] = {
             "use_slow_interval": ACTIVE_BOTS[bot_id]["use_slow_interval"],
             "max_queue_per_user": ACTIVE_BOTS[bot_id]["max_queue_per_user"],
             "max_msg_per_second": ACTIVE_BOTS[bot_id]["max_msg_per_second"],
             "max_concurrent_workers": ACTIVE_BOTS[bot_id]["max_concurrent_workers"],
         }
-    }
-    
-    # Check database connection
-    if not DB_CONNECTIONS.get(bot_id):
-        status["ok"] = False
-        status["error"] = "database_not_connected"
     
     return jsonify(status), 200 if status["ok"] else 503
 
@@ -2202,22 +2364,28 @@ def health_all():
     overall_ok = True
     bots_status = {}
     
-    for bot_id in ACTIVE_BOTS.keys():
+    for bot_id in BOT_CONFIGS.keys():
+        is_active = bot_id in ACTIVE_BOTS
         bot_status = {
+            "active": is_active,
             "configured": True,
-            "db_connected": DB_CONNECTIONS.get(bot_id) is not None,
+            "db_connected": is_bot_valid(bot_id) if is_active else False,
             "workers_active": len(_user_workers.get(bot_id, {})),
-            "use_slow_interval": ACTIVE_BOTS[bot_id]["use_slow_interval"],
         }
+        
+        if is_active:
+            bot_status["use_slow_interval"] = ACTIVE_BOTS[bot_id]["use_slow_interval"]
+        
         bots_status[bot_id] = bot_status
         
-        if not DB_CONNECTIONS.get(bot_id):
+        if is_active and not is_bot_valid(bot_id):
             overall_ok = False
     
     status = {
         "ok": overall_ok,
         "timestamp": now_ts(),
-        "active_bots": list(ACTIVE_BOTS.keys()),
+        "total_bots": len(BOT_CONFIGS),
+        "active_bots": len(ACTIVE_BOTS),
         "bots": bots_status
     }
     
@@ -2280,7 +2448,7 @@ signal.signal(signal.SIGINT, _graceful_shutdown)
 # ============================================================================
 def main():
     # Initialize all bots
-    logger.info("Initializing %d bots: %s", len(ACTIVE_BOTS), ", ".join(ACTIVE_BOTS.keys()))
+    logger.info("Initializing %d active bots: %s", len(ACTIVE_BOTS), ", ".join(ACTIVE_BOTS.keys()))
     initialize_all_bots()
     
     # Set webhooks for all bots
