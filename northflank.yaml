@@ -19,7 +19,7 @@ services:
       - name: ALLOWED_USERS
         description: "Comma-separated allowed user IDs"
       - name: DB_PATH
-        value: "/data/botdata.sqlite3"
+        value: "/tmp/botdata.sqlite3"
       - name: MAX_QUEUE_PER_USER
         value: "5"
       - name: MAX_MSG_PER_SECOND
