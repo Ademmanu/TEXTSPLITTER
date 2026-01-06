@@ -39,7 +39,7 @@ def parse_id_list(raw: str) -> List[int]:
             continue
     return ids
 
-# Configuration for all three bots
+# Configuration for all three bots - DEFAULT ALL PATHS TO /tmp/
 BOTS_CONFIG = {
     "bot_a": {
         "name": "Bot A",
@@ -47,8 +47,8 @@ BOTS_CONFIG = {
         "webhook_url": os.environ.get("WEBHOOK_URL_A", ""),
         "owner_ids_raw": os.environ.get("OWNER_IDS_A", ""),
         "allowed_users_raw": os.environ.get("ALLOWED_USERS_A", ""),
-        "owner_tag": "Owner (@justmemmy)",  # Can be customized per bot
-        "db_path": os.environ.get("DB_PATH_A", "botdata_a.sqlite3"),
+        "owner_tag": "Owner (@justmemmy)",
+        "db_path": os.environ.get("DB_PATH_A", "/tmp/botdata_a.sqlite3"),  # DEFAULT TO /tmp/
         "interval_speed": "fast",  # app.py intervals (0.5-0.7s)
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_A", "5")),
         "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", "50")),
@@ -61,7 +61,7 @@ BOTS_CONFIG = {
         "owner_ids_raw": os.environ.get("OWNER_IDS_B", ""),
         "allowed_users_raw": os.environ.get("ALLOWED_USERS_B", ""),
         "owner_tag": "Owner (@justmemmy)",
-        "db_path": os.environ.get("DB_PATH_B", "botdata_b.sqlite3"),
+        "db_path": os.environ.get("DB_PATH_B", "/tmp/botdata_b.sqlite3"),  # DEFAULT TO /tmp/
         "interval_speed": "fast",  # app.py intervals (0.5-0.7s)
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_B", "5")),
         "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", "50")),
@@ -74,7 +74,7 @@ BOTS_CONFIG = {
         "owner_ids_raw": os.environ.get("OWNER_IDS_C", ""),
         "allowed_users_raw": os.environ.get("ALLOWED_USERS_C", ""),
         "owner_tag": "Owner (@justmemmy)",
-        "db_path": os.environ.get("DB_PATH_C", "botdata_c.sqlite3"),
+        "db_path": os.environ.get("DB_PATH_C", "/tmp/botdata_c.sqlite3"),  # DEFAULT TO /tmp/
         "interval_speed": "slow",  # app (1).py intervals (1.0-1.2s)
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_C", "5")),
         "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", "50")),
@@ -159,34 +159,20 @@ def _ensure_db_parent(dirpath: str):
         logger.warning("Could not create DB parent directory %s: %s", dirpath, e)
 
 def init_db(bot_id: str):
-    """Initialize database for a specific bot with DB path fix applied to all bots"""
+    """Initialize database for a specific bot - SIMPLIFIED VERSION"""
     config = BOTS_CONFIG[bot_id]
     state = BOT_STATES[bot_id]
     
-    # Apply DB path fix from app.py to ALL bots
+    # Get the db_path from config (already defaults to /tmp/)
     db_path = config["db_path"]
-    if not db_path or db_path == "botdata.sqlite3":
-        db_path = f"/tmp/{bot_id}_botdata.sqlite3"
-        config["db_path"] = db_path
-    elif db_path.endswith("botdata.sqlite3"):
-        # If it's a default-like name, prepend bot_id
-        db_path = f"/tmp/{bot_id}_{os.path.basename(db_path)}"
-        config["db_path"] = db_path
     
-    # Ensure the directory exists
-    parent = os.path.dirname(os.path.abspath(db_path))
-    if parent:
-        _ensure_db_parent(parent)
+    # Log the path we're using
+    logger.info("Initializing DB for %s at %s", bot_id, db_path)
     
-    # Also try to create the file if it doesn't exist (for permissions)
-    try:
-        if not os.path.exists(db_path):
-            with open(db_path, 'w') as f:
-                f.write('')  # Create empty file
-            logger.info("Created DB file for %s at %s", bot_id, db_path)
-    except Exception as e:
-        logger.warning("Could not create DB file for %s at %s: %s", bot_id, db_path, e)
-
+    # If path doesn't start with /tmp/, log a warning but continue
+    if not db_path.startswith("/tmp/") and db_path != ":memory:":
+        logger.warning("DB path for %s is not in /tmp/: %s", bot_id, db_path)
+    
     def _create_schema(conn):
         c = conn.cursor()
         c.execute("""
@@ -246,6 +232,14 @@ def init_db(bot_id: str):
         conn.commit()
 
     try:
+        # Try to create parent directory if it doesn't exist
+        parent_dir = os.path.dirname(db_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            try:
+                os.makedirs(parent_dir, exist_ok=True)
+            except Exception as e:
+                logger.warning("Could not create parent directory %s: %s", parent_dir, e)
+        
         conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -256,8 +250,8 @@ def init_db(bot_id: str):
         _create_schema(conn)
         state["db_conn"] = conn
         logger.info("DB initialized for %s at %s", bot_id, db_path)
-    except Exception:
-        logger.exception("Failed to open DB for %s at %s, falling back to in-memory DB", bot_id, db_path)
+    except Exception as e:
+        logger.exception("Failed to open DB for %s at %s, falling back to in-memory DB: %s", bot_id, db_path, e)
         try:
             conn = sqlite3.connect(":memory:", timeout=30, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL;")
