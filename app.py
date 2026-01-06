@@ -246,7 +246,7 @@ def init_db_for_bot(bot_id: str):
         _create_schema(conn)
         DB_CONNECTIONS[bot_id] = conn
         logger.info("DB initialized for %s at %s", bot_id, db_path)
-    except Exception:
+    except Exception as e:
         logger.exception("Failed to open DB for %s at %s, falling back to in-memory DB", bot_id, db_path)
         try:
             conn = sqlite3.connect(":memory:", timeout=30, check_same_thread=False)
@@ -259,9 +259,16 @@ def init_db_for_bot(bot_id: str):
             _create_schema(conn)
             DB_CONNECTIONS[bot_id] = conn
             logger.info("In-memory DB initialized for %s", bot_id)
-        except Exception:
-            DB_CONNECTIONS[bot_id] = None
-            logger.exception("Failed to initialize in-memory DB for %s", bot_id)
+        except Exception as e2:
+            # FIX: Don't set to None, create a minimal in-memory connection
+            logger.exception("Failed to initialize in-memory DB for %s, creating emergency connection", bot_id)
+            try:
+                conn = sqlite3.connect(":memory:", timeout=30, check_same_thread=False)
+                DB_CONNECTIONS[bot_id] = conn
+                logger.info("Emergency in-memory DB created for %s", bot_id)
+            except Exception:
+                DB_CONNECTIONS[bot_id] = None
+                logger.critical("CRITICAL: Could not initialize any DB for %s", bot_id)
 
 def ensure_send_failures_columns_for_bot(bot_id: str):
     """Ensure migration for a specific bot's database"""
@@ -341,7 +348,7 @@ def is_bot_valid(bot_id: str) -> bool:
     """Check if a bot is properly initialized before accessing its resources"""
     return (bot_id in ACTIVE_BOTS and 
             bot_id in DB_CONNECTIONS and 
-            DB_CONNECTIONS[bot_id] is not None)
+            DB_CONNECTIONS.get(bot_id) is not None)  # Use .get() for safety
 
 # ============================================================================
 # REQUESTS SESSION CONFIGURATION (SHARED)
@@ -1980,14 +1987,18 @@ def handle_message(bot_id: str, msg):
     username = user.get("username") or (user.get("first_name") or "")
     text = msg.get("text") or ""
 
-    # Update username for this bot only
-    try:
-        with DB_LOCKS[bot_id]:
-            c = DB_CONNECTIONS[bot_id].cursor()
-            c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username or "", uid))
-            DB_CONNECTIONS[bot_id].commit()
-    except Exception:
-        logger.exception("webhook: update allowed_users username failed for %s", bot_id)
+    # FIX: Check if database connection is valid before trying to update username
+    if is_bot_valid(bot_id):
+        # Update username for this bot only
+        try:
+            with DB_LOCKS[bot_id]:
+                c = DB_CONNECTIONS[bot_id].cursor()
+                c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username or "", uid))
+                DB_CONNECTIONS[bot_id].commit()
+        except Exception:
+            logger.exception("webhook: update allowed_users username failed for %s", bot_id)
+    else:
+        logger.warning(f"Cannot update username for {bot_id}: database not initialized")
 
     # Check if owner is in input mode for THIS bot
     if uid in config["owner_ids"] and is_owner_in_operation_for_bot(bot_id, uid):
