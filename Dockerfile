@@ -11,4 +11,4 @@ USER worker
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8080/health', timeout=2)" || exit 1
-CMD gunicorn --bind 0.0.0.0:$PORT --workers=2 --threads=4 --worker-class=gthread app:app
+CMD gunicorn --bind 0.0.0.0:8080 --workers=2 --threads=4 --worker-class=gthread app:app
