@@ -1,0 +1,50 @@
+version: '1'
+services:
+  word-splitter-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 8080
+    env:
+      - name: PORT
+        value: "8080"
+      - name: TELEGRAM_TOKEN
+        description: "Your Telegram Bot Token from @BotFather"
+        secret: true
+      - name: WEBHOOK_URL
+        description: "Full webhook URL (will be provided after deployment)"
+      - name: OWNER_IDS
+        description: "Comma-separated Telegram user IDs (e.g., 123456789,987654321)"
+      - name: ALLOWED_USERS
+        description: "Comma-separated allowed user IDs"
+      - name: DB_PATH
+        value: "/tmp/botdata.sqlite3"
+      - name: MAX_QUEUE_PER_USER
+        value: "5"
+      - name: MAX_MSG_PER_SECOND
+        value: "50"
+      - name: REQUESTS_TIMEOUT
+        value: "10"
+      - name: MAX_CONCURRENT_WORKERS
+        value: "25"
+      - name: LOG_RETENTION_DAYS
+        value: "30"
+      - name: FAILURE_NOTIFY_THRESHOLD
+        value: "6"
+      - name: PERMANENT_SUSPEND_DAYS
+        value: "365"
+    resources:
+      memory: 512Mi
+      cpu: 500m
+    healthCheck:
+      path: /health
+      port: 8080
+      initialDelay: 10
+      period: 30
+    autoscale:
+      enabled: false
+    domains:
+      - host: word-splitter-bot
+        paths:
+          - /
