@@ -112,9 +112,20 @@ BOT_STATES = {
         "token_bucket": None,
         "active_workers_semaphore": None,
         "session": None,
+        "initialized": False,  # Track initialization status
     }
     for bot_id in BOTS_CONFIG
 }
+
+# Global scheduler instance - initialized once
+_scheduler = None
+
+def get_scheduler():
+    """Get or create the scheduler instance (singleton)"""
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler()
+    return _scheduler
 
 # ===================== SHARED UTILITIES =====================
 
@@ -160,6 +171,10 @@ def _ensure_db_parent(dirpath: str):
 
 def init_db(bot_id: str):
     """Initialize database for a specific bot - SIMPLIFIED VERSION"""
+    # Check if already initialized
+    if BOT_STATES[bot_id]["initialized"] and BOT_STATES[bot_id]["db_conn"] is not None:
+        return
+    
     config = BOTS_CONFIG[bot_id]
     state = BOT_STATES[bot_id]
     
@@ -249,6 +264,7 @@ def init_db(bot_id: str):
         conn.execute("PRAGMA busy_timeout=30000;")
         _create_schema(conn)
         state["db_conn"] = conn
+        state["initialized"] = True
         logger.info("DB initialized for %s at %s", bot_id, db_path)
     except Exception as e:
         logger.exception("Failed to open DB for %s at %s, falling back to in-memory DB: %s", bot_id, db_path, e)
@@ -262,6 +278,7 @@ def init_db(bot_id: str):
             conn.execute("PRAGMA busy_timeout=30000;")
             _create_schema(conn)
             state["db_conn"] = conn
+            state["initialized"] = True
             logger.info("In-memory DB initialized for %s", bot_id)
         except Exception:
             state["db_conn"] = None
@@ -291,49 +308,57 @@ def ensure_send_failures_columns(bot_id: str):
     except Exception:
         logger.exception("ensure_send_failures_columns failed for %s", bot_id)
 
-# Initialize databases for all bots
-for bot_id in BOTS_CONFIG:
-    init_db(bot_id)
-    if BOT_STATES[bot_id]["db_conn"]:
-        ensure_send_failures_columns(bot_id)
-    
-    # Ensure owners auto-added as allowed
-    config = BOTS_CONFIG[bot_id]
-    for oid in config["owner_ids"]:
-        try:
-            with BOT_STATES[bot_id]["db_lock"]:
-                c = BOT_STATES[bot_id]["db_conn"].cursor()
-                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (oid,))
-                exists = c.fetchone()
-                if not exists:
-                    c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", 
-                              (oid, "", now_ts()))
-                    BOT_STATES[bot_id]["db_conn"].commit()
-        except Exception:
-            logger.exception("Error ensuring owner in allowed_users for %s", bot_id)
-    
-    # Ensure provided ALLOWED_USERS auto-added
-    for uid in config["allowed_users"]:
-        if uid in config["owner_ids"]:
-            continue
-        try:
-            with BOT_STATES[bot_id]["db_lock"]:
-                c = BOT_STATES[bot_id]["db_conn"].cursor()
-                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,))
-                rows = c.fetchone()
-                if not rows:
-                    c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)",
-                              (uid, "", now_ts()))
-                    BOT_STATES[bot_id]["db_conn"].commit()
+def initialize_all_bots():
+    """Initialize all bots - to be called once"""
+    # Initialize databases for all bots
+    for bot_id in BOTS_CONFIG:
+        init_db(bot_id)
+        if BOT_STATES[bot_id]["db_conn"]:
+            ensure_send_failures_columns(bot_id)
+        
+        # Ensure owners auto-added as allowed
+        config = BOTS_CONFIG[bot_id]
+        for oid in config["owner_ids"]:
             try:
-                if config["telegram_api"]:
-                    get_session(bot_id).post(f"{config['telegram_api']}/sendMessage", json={
-                        "chat_id": uid, "text": "✅ You have been added. Send any text to start."
-                    }, timeout=3)
+                with BOT_STATES[bot_id]["db_lock"]:
+                    c = BOT_STATES[bot_id]["db_conn"].cursor()
+                    c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (oid,))
+                    exists = c.fetchone()
+                    if not exists:
+                        c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", 
+                                  (oid, "", now_ts()))
+                        BOT_STATES[bot_id]["db_conn"].commit()
             except Exception:
-                pass
-        except Exception:
-            logger.exception("Auto-add allowed user error for %s", bot_id)
+                logger.exception("Error ensuring owner in allowed_users for %s", bot_id)
+        
+        # Ensure provided ALLOWED_USERS auto-added
+        for uid in config["allowed_users"]:
+            if uid in config["owner_ids"]:
+                continue
+            try:
+                with BOT_STATES[bot_id]["db_lock"]:
+                    c = BOT_STATES[bot_id]["db_conn"].cursor()
+                    c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,))
+                    rows = c.fetchone()
+                    if not rows:
+                        c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)",
+                                  (uid, "", now_ts()))
+                        BOT_STATES[bot_id]["db_conn"].commit()
+                try:
+                    if config["telegram_api"]:
+                        get_session(bot_id).post(f"{config['telegram_api']}/sendMessage", json={
+                            "chat_id": uid, "text": "✅ You have been added. Send any text to start."
+                        }, timeout=3)
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception("Auto-add allowed user error for %s", bot_id)
+        
+        # Initialize token bucket and semaphore
+        BOT_STATES[bot_id]["token_bucket"] = TokenBucket(BOTS_CONFIG[bot_id]["max_msg_per_second"])
+        BOT_STATES[bot_id]["active_workers_semaphore"] = threading.Semaphore(
+            BOTS_CONFIG[bot_id]["max_concurrent_workers"]
+        )
 
 # ===================== SESSION MANAGEMENT =====================
 
@@ -423,13 +448,6 @@ class TokenBucket:
     def notify_all(self):
         with self.cond:
             self.cond.notify_all()
-
-# Initialize token buckets for all bots
-for bot_id in BOTS_CONFIG:
-    BOT_STATES[bot_id]["token_bucket"] = TokenBucket(BOTS_CONFIG[bot_id]["max_msg_per_second"])
-    BOT_STATES[bot_id]["active_workers_semaphore"] = threading.Semaphore(
-        BOTS_CONFIG[bot_id]["max_concurrent_workers"]
-    )
 
 def acquire_token(bot_id: str, timeout=10.0):
     return BOT_STATES[bot_id]["token_bucket"].acquire(timeout=timeout)
@@ -1266,51 +1284,66 @@ def prune_old_logs(bot_id: str):
 
 # ===================== SCHEDULER =====================
 
-scheduler = BackgroundScheduler()
+_scheduler_started = False
 
-# Add jobs for each bot
-for bot_id in BOTS_CONFIG:
-    scheduler.add_job(
-        lambda b=bot_id: send_hourly_owner_stats(b),
-        "interval", 
-        hours=1, 
-        next_run_time=datetime.utcnow() + timedelta(seconds=10),
-        timezone='UTC',
-        id=f"hourly_stats_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: check_and_lift(b),
-        "interval", 
-        minutes=1,
-        next_run_time=datetime.utcnow() + timedelta(seconds=15),
-        timezone='UTC',
-        id=f"check_suspended_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: prune_old_logs(b),
-        "interval", 
-        hours=24,
-        next_run_time=datetime.utcnow() + timedelta(seconds=30),
-        timezone='UTC',
-        id=f"prune_logs_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: check_stuck_tasks(b),
-        "interval", 
-        minutes=1,
-        next_run_time=datetime.utcnow() + timedelta(seconds=45),
-        timezone='UTC',
-        id=f"check_stuck_{bot_id}"
-    )
-
-scheduler.start()
+def initialize_scheduler():
+    """Initialize scheduler with jobs for all bots - to be called once"""
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    
+    scheduler = get_scheduler()
+    
+    # Add jobs for each bot
+    for bot_id in BOTS_CONFIG:
+        scheduler.add_job(
+            lambda b=bot_id: send_hourly_owner_stats(b),
+            "interval", 
+            hours=1, 
+            next_run_time=datetime.utcnow() + timedelta(seconds=10),
+            timezone='UTC',
+            id=f"hourly_stats_{bot_id}",
+            replace_existing=True
+        )
+        scheduler.add_job(
+            lambda b=bot_id: check_and_lift(b),
+            "interval", 
+            minutes=1,
+            next_run_time=datetime.utcnow() + timedelta(seconds=15),
+            timezone='UTC',
+            id=f"check_suspended_{bot_id}",
+            replace_existing=True
+        )
+        scheduler.add_job(
+            lambda b=bot_id: prune_old_logs(b),
+            "interval", 
+            hours=24,
+            next_run_time=datetime.utcnow() + timedelta(seconds=30),
+            timezone='UTC',
+            id=f"prune_logs_{bot_id}",
+            replace_existing=True
+        )
+        scheduler.add_job(
+            lambda b=bot_id: check_stuck_tasks(b),
+            "interval", 
+            minutes=1,
+            next_run_time=datetime.utcnow() + timedelta(seconds=45),
+            timezone='UTC',
+            id=f"check_stuck_{bot_id}",
+            replace_existing=True
+        )
+    
+    scheduler.start()
+    _scheduler_started = True
+    logger.info("Scheduler started with jobs for all bots")
 
 # ===================== SHUTDOWN HANDLER =====================
 
 def _graceful_shutdown(signum, frame):
     logger.info("Graceful shutdown signal received (%s). Stopping scheduler and workers...", signum)
     try:
-        scheduler.shutdown(wait=False)
+        if _scheduler:
+            _scheduler.shutdown(wait=False)
     except Exception:
         pass
     
@@ -2287,12 +2320,20 @@ def set_webhook(bot_id: str):
 # ===================== MAIN =====================
 
 def main():
+    # Initialize all bots (only once)
+    initialize_all_bots()
+    
+    # Initialize scheduler (only once)
+    initialize_scheduler()
+    
     # Set webhooks for all bots
     for bot_id in BOTS_CONFIG:
         set_webhook(bot_id)
     
     port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    
+    # Disable Flask reloader to prevent duplicate execution
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 if __name__ == "__main__":
     main()
