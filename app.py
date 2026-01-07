@@ -1203,7 +1203,7 @@ def fetch_display_username_for_bot(bot_id: str, user_id: int):
         c.execute("SELECT username FROM allowed_users WHERE user_id = ?", (user_id,))
         r2 = c.fetchone()
         if r2 and r2[0]:
-            return r[0]
+            return r2[0]
     return ""
 
 def compute_last_hour_stats_for_bot(bot_id: str):
@@ -1361,69 +1361,47 @@ def get_user_task_counts_for_bot(bot_id: str, user_id: int):
 # ============================================================================
 # SCHEDULER SETUP (PER-BOT JOBS) - FIXED: ONLY FOR ACTIVE BOTS
 # ============================================================================
-scheduler = None
-scheduler_started = False
+scheduler = BackgroundScheduler()
 
-def start_scheduler():
-    """Start the scheduler for all active bots"""
-    global scheduler, scheduler_started
+# CRITICAL FIX: Only schedule jobs for ACTIVE bots (bots with tokens)
+for bot_id in ACTIVE_BOTS.keys():  # CHANGED FROM BOT_CONFIGS.keys()
+    # Hourly stats for each bot
+    scheduler.add_job(
+        lambda b=bot_id: send_hourly_owner_stats_for_bot(b),
+        "interval", hours=1, 
+        next_run_time=datetime.utcnow() + timedelta(seconds=10),
+        timezone='UTC',
+        id=f"hourly_stats_{bot_id}"
+    )
     
-    if scheduler_started:
-        logger.warning("Scheduler already started, skipping")
-        return
+    # Check suspensions for each bot
+    scheduler.add_job(
+        lambda b=bot_id: check_and_lift_for_bot(b),
+        "interval", minutes=1,
+        next_run_time=datetime.utcnow() + timedelta(seconds=15),
+        timezone='UTC',
+        id=f"check_suspended_{bot_id}"
+    )
     
-    scheduler = BackgroundScheduler()
+    # Prune logs for each bot
+    scheduler.add_job(
+        lambda b=bot_id: prune_old_logs_for_bot(b),
+        "interval", hours=24,
+        next_run_time=datetime.utcnow() + timedelta(seconds=30),
+        timezone='UTC',
+        id=f"prune_logs_{bot_id}"
+    )
     
-    # CRITICAL FIX: Only schedule jobs for ACTIVE bots (bots with tokens)
-    # Also ensure jobs don't get added multiple times
-    for bot_id in ACTIVE_BOTS.keys():
-        # Hourly stats for each bot - schedule at minute 0 of every hour
-        scheduler.add_job(
-            func=lambda b=bot_id: send_hourly_owner_stats_for_bot(b),
-            trigger='cron',
-            hour='*',
-            minute=0,
-            second=0,
-            id=f"hourly_stats_{bot_id}",
-            replace_existing=True,
-            timezone='UTC'
-        )
-        
-        # Check suspensions for each bot - every minute
-        scheduler.add_job(
-            func=lambda b=bot_id: check_and_lift_for_bot(b),
-            trigger='interval',
-            minutes=1,
-            id=f"check_suspended_{bot_id}",
-            replace_existing=True
-        )
-        
-        # Prune logs for each bot - every day at 2:00 AM
-        scheduler.add_job(
-            func=lambda b=bot_id: prune_old_logs_for_bot(b),
-            trigger='cron',
-            hour=2,
-            minute=0,
-            second=0,
-            id=f"prune_logs_{bot_id}",
-            replace_existing=True,
-            timezone='UTC'
-        )
-        
-        # Check stuck tasks for each bot - every minute
-        scheduler.add_job(
-            func=lambda b=bot_id: check_stuck_tasks_for_bot(b),
-            trigger='interval',
-            minutes=1,
-            id=f"check_stuck_{bot_id}",
-            replace_existing=True
-        )
-        
-        logger.info(f"Scheduled jobs for bot: {bot_id}")
-    
-    scheduler.start()
-    scheduler_started = True
-    logger.info("Scheduler started with jobs for %d active bots", len(ACTIVE_BOTS))
+    # Check stuck tasks for each bot
+    scheduler.add_job(
+        lambda b=bot_id: check_stuck_tasks_for_bot(b),
+        "interval", minutes=1,
+        next_run_time=datetime.utcnow() + timedelta(seconds=45),
+        timezone='UTC',
+        id=f"check_stuck_{bot_id}"
+    )
+
+scheduler.start()
 
 # ============================================================================
 # OWNER OPERATIONS (PER-BOT) - FIXED INITIALIZATION
@@ -2438,14 +2416,10 @@ def set_all_webhooks():
 def _graceful_shutdown(signum, frame):
     logger.info("Graceful shutdown signal received (%s). Stopping scheduler and workers...", signum)
     
-    global scheduler_started
-    
-    if scheduler and scheduler_started:
-        try:
-            scheduler.shutdown(wait=False)
-            scheduler_started = False
-        except Exception:
-            pass
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     
     # Stop all workers for all bots
     for bot_id in ACTIVE_BOTS.keys():
@@ -2482,9 +2456,6 @@ def main():
         set_all_webhooks()
     except Exception:
         logger.exception("Failed to set webhooks during initialization")
-    
-    # Start scheduler
-    start_scheduler()
     
     # Start Flask app
     port = int(os.environ.get("PORT", "10000"))
