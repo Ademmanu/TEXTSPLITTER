@@ -9,7 +9,7 @@ COPY . .
 RUN useradd -m -u 1000 worker
 USER worker
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8080/health', timeout=2)" || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8080/health/a', timeout=2)" || exit 1
 CMD python -c "import threading; threading.stack_size(1024*1024)" && \
-    gunicorn --bind 0.0.0.0:8080 --workers=1 --threads=40 --worker-class=gthread app:app
+    gunicorn --bind 0.0.0.0:8080 --workers=1 --threads=40 --worker-class=gthread --timeout=120 app:app
