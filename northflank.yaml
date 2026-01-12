@@ -1,4 +1,3 @@
-# northflank.yaml
 version: '1'
 services:
   multi-bot-wordsplitter:
@@ -57,24 +56,24 @@ services:
       - name: MAX_QUEUE_PER_USER_A
         value: "5"
       - name: MAX_MSG_PER_SECOND_A
-        value: "30"  # Changed from 50 to 30
+        value: "50"
       - name: MAX_CONCURRENT_WORKERS_A
-        value: "15"  # Changed from 25 to 15
+        value: "25"
       
       - name: MAX_QUEUE_PER_USER_B
         value: "5"
       - name: MAX_MSG_PER_SECOND_B
-        value: "30"  # Changed from 50 to 30
+        value: "50"
       - name: MAX_CONCURRENT_WORKERS_B
-        value: "15"  # Changed from 25 to 15
+        value: "25"
       
       # Bot C specific settings (slow intervals - 1.0-1.2s)
       - name: MAX_QUEUE_PER_USER_C
         value: "5"
       - name: MAX_MSG_PER_SECOND_C
-        value: "30"  # Changed from 50 to 30
+        value: "50"
       - name: MAX_CONCURRENT_WORKERS_C
-        value: "15"  # Changed from 25 to 15
+        value: "25"
       
       # Shared settings for all bots
       - name: REQUESTS_TIMEOUT
@@ -85,21 +84,16 @@ services:
         value: "6"
       - name: PERMANENT_SUSPEND_DAYS
         value: "365"
-      
-      # Performance settings
-      - name: GUNICORN_MODE
-        value: "true"
     
     resources:
-      memory: 512Mi  # Reduced for Northflank free tier
-      cpu: 500m      # Reduced for Northflank free tier
+      memory: 768Mi  # Increased for 3 bots
+      cpu: 750m      # Increased for 3 bots
     healthCheck:
-      # Use bot A health endpoint (lightweight)
+      # Multiple health endpoints available, using bot A as main health check
       path: /health/a
       port: 8080
-      initialDelay: 20  # Increased for slower startup
-      period: 45        # Increased check interval
-      timeout: 10       # Increased timeout
+      initialDelay: 10
+      period: 30
     autoscale:
       enabled: false
     domains:
