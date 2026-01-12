@@ -56,24 +56,24 @@ services:
       - name: MAX_QUEUE_PER_USER_A
         value: "5"
       - name: MAX_MSG_PER_SECOND_A
-        value: "50"
+        value: "30"
       - name: MAX_CONCURRENT_WORKERS_A
-        value: "25"
+        value: "15"
       
       - name: MAX_QUEUE_PER_USER_B
         value: "5"
       - name: MAX_MSG_PER_SECOND_B
-        value: "50"
+        value: "30"
       - name: MAX_CONCURRENT_WORKERS_B
-        value: "25"
+        value: "15"
       
       # Bot C specific settings (slow intervals - 1.0-1.2s)
       - name: MAX_QUEUE_PER_USER_C
         value: "5"
       - name: MAX_MSG_PER_SECOND_C
-        value: "50"
+        value: "30"
       - name: MAX_CONCURRENT_WORKERS_C
-        value: "25"
+        value: "15"
       
       # Shared settings for all bots
       - name: REQUESTS_TIMEOUT
@@ -86,8 +86,8 @@ services:
         value: "365"
     
     resources:
-      memory: 768Mi  # Increased for 3 bots
-      cpu: 750m      # Increased for 3 bots
+      memory: 512Mi  # Increased for 3 bots
+      cpu: 500m      # Increased for 3 bots
     healthCheck:
       # Multiple health endpoints available, using bot A as main health check
       path: /health/a
