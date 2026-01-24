@@ -1,5 +1,3 @@
-[file name]: northflank.yaml
-[file content begin]
 version: '1'
 services:
   multi-bot-wordsplitter:
@@ -13,9 +11,9 @@ services:
       - name: PORT
         value: 8080
       
-      # PostgreSQL Database Configuration
+      # PostgreSQL Database Configuration (ONE URL FOR ALL BOTS)
       - name: DATABASE_URL
-        description: "PostgreSQL connection string (e.g., postgresql://user:pass@host:port/db)"
+        description: "PostgreSQL connection string (e.g., postgresql://user:pass@host:5432/dbname)"
         secret: true
       
       # Bot A Configuration
@@ -100,6 +98,5 @@ services:
           - /
     addons:
       postgres:
-        plan: hobbyist  # Or appropriate plan for your needs
+        plan: hobbyist
         version: "15"
-[file content end]
