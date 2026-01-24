@@ -2656,7 +2656,7 @@ def handle_webhook(bot_id: str):
                                 target = int(parts[0])
                             except Exception:
                                 send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             dur = parts[1]
                             reason = parts[2] if len(parts) > 2 else ""
@@ -2680,7 +2680,7 @@ def handle_webhook(bot_id: str):
                             target = int(text.strip())
                         except Exception:
                             send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
-                            return jsonify({"ok": True}")
+                            return jsonify({"ok": True})
                         
                         ok = unsuspend_user(bot_id, target)
                         if ok:
