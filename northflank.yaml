@@ -7,23 +7,23 @@ services:
     ports:
       - 8080
     env:
+      # PostgreSQL Database (single URL for all bots)
+      - name: DATABASE_URL
+        description: "PostgreSQL connection URL"
+        secret: true
+      
       # Port configuration
       - name: PORT
         value: 8080
-      
-      # PostgreSQL Database Configuration (ONE URL FOR ALL BOTS)
-      - name: DATABASE_URL
-        description: "PostgreSQL connection string (e.g., postgresql://user:pass@host:5432/dbname)"
-        secret: true
       
       # Bot A Configuration
       - name: TELEGRAM_TOKEN_A
         description: "Telegram Bot Token for Bot A from @BotFather"
         secret: true
       - name: WEBHOOK_URL_A
-        description: "Full webhook URL for Bot A (e.g., https://yourserver.com/webhook/a)"
+        description: "Full webhook URL for Bot A"
       - name: OWNER_IDS_A
-        description: "Comma-separated Telegram user IDs for Bot A owners (e.g., 123456789,987654321)"
+        description: "Comma-separated Telegram user IDs for Bot A owners"
       - name: ALLOWED_USERS_A
         description: "Comma-separated allowed user IDs for Bot A"
       
@@ -32,7 +32,7 @@ services:
         description: "Telegram Bot Token for Bot B from @BotFather"
         secret: true
       - name: WEBHOOK_URL_B
-        description: "Full webhook URL for Bot B (e.g., https://yourserver.com/webhook/b)"
+        description: "Full webhook URL for Bot B"
       - name: OWNER_IDS_B
         description: "Comma-separated Telegram user IDs for Bot B owners"
       - name: ALLOWED_USERS_B
@@ -43,11 +43,19 @@ services:
         description: "Telegram Bot Token for Bot C from @BotFather"
         secret: true
       - name: WEBHOOK_URL_C
-        description: "Full webhook URL for Bot C (e.g., https://yourserver.com/webhook/c)"
+        description: "Full webhook URL for Bot C"
       - name: OWNER_IDS_C
         description: "Comma-separated Telegram user IDs for Bot C owners"
       - name: ALLOWED_USERS_C
         description: "Comma-separated allowed user IDs for Bot C"
+      
+      # Database paths for SQLite fallback
+      - name: DB_PATH_A
+        value: "/tmp/botdata_a.sqlite3"
+      - name: DB_PATH_B
+        value: "/tmp/botdata_b.sqlite3"
+      - name: DB_PATH_C
+        value: "/tmp/botdata_c.sqlite3"
       
       # Bot A & B specific settings (fast intervals - 0.5-0.7s)
       - name: MAX_QUEUE_PER_USER_A
@@ -83,9 +91,10 @@ services:
         value: "365"
     
     resources:
-      memory: 512Mi
-      cpu: 500m
+      memory: 512Mi  # Increased for 3 bots
+      cpu: 500m      # Increased for 3 bots
     healthCheck:
+      # Multiple health endpoints available, using bot A as main health check
       path: /health/a
       port: 8080
       initialDelay: 10
@@ -96,7 +105,3 @@ services:
       - host: multi-bot-wordsplitter
         paths:
           - /
-    addons:
-      postgres:
-        plan: hobbyist
-        version: "15"
