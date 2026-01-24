@@ -1824,11 +1824,18 @@ def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0)
     
     tasks = []
     for row in result:
-        task_id = row['id'] if isinstance(row, dict) else row[0]
-        text = row['text'] if isinstance(row, dict) else row[1]
-        created_at = row['created_at'] if isinstance(row, dict) else row[2]
-        total_words = row['total_words'] if isinstance(row, dict) else row[3]
-        sent_count = row['sent_count'] if isinstance(row, dict) else row[4]
+        if isinstance(row, dict):
+            task_id = row['id']
+            text = row['text']
+            created_at = row['created_at']
+            total_words = row['total_words']
+            sent_count = row['sent_count']
+        else:
+            task_id = row[0]
+            text = row[1]
+            created_at = row[2]
+            total_words = row[3]
+            sent_count = row[4]
         
         words = split_text_to_words(text)
         preview = " ".join(words[:2]) if len(words) >= 2 else words[0] if words else "(empty)"
@@ -1908,7 +1915,7 @@ def parse_duration(duration_str: str) -> Tuple[int, str]:
                 parts.append(f"{num} {label}s")
                 
         except ValueError:
-            return None, f"Invalid number: {value}{unit}")
+            return None, f"Invalid number: {value}{unit}"
         except KeyError:
             return None, f"Invalid unit: {unit}"
     
@@ -2657,7 +2664,7 @@ def handle_webhook(bot_id: str):
                             result = parse_duration(dur)
                             if result[0] is None:
                                 send_message(bot_id, uid, f"❌ {result[1]}\n\nValid examples: 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             seconds, formatted_duration = result
                             suspend_user(bot_id, target, seconds, reason)
@@ -2666,7 +2673,7 @@ def handle_webhook(bot_id: str):
                             
                             clear_owner_state(bot_id, uid)
                             send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                            return jsonify({"ok": True}")
+                            return jsonify({"ok": True})
                     
                     elif operation == "unsuspend":
                         try:
@@ -2693,13 +2700,13 @@ def handle_webhook(bot_id: str):
                                     raise ValueError
                             except Exception:
                                 send_message(bot_id, uid, "❌ Please enter a valid positive number of hours.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             all_users = get_all_users_ordered(bot_id)
                             if not all_users:
                                 clear_owner_state(bot_id, uid)
                                 send_message(bot_id, uid, "📋 No users found.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             first_user_id, first_username, first_added_at = all_users[0]
                             username_display = at_username(first_username) if first_username else "no username"
