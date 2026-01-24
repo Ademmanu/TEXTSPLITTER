@@ -7,11 +7,6 @@ services:
     ports:
       - 8080
     env:
-      # PostgreSQL Database (single URL for all bots)
-      - name: DATABASE_URL
-        description: "PostgreSQL connection URL"
-        secret: true
-      
       # Port configuration
       - name: PORT
         value: 8080
@@ -21,9 +16,9 @@ services:
         description: "Telegram Bot Token for Bot A from @BotFather"
         secret: true
       - name: WEBHOOK_URL_A
-        description: "Full webhook URL for Bot A"
+        description: "Full webhook URL for Bot A (e.g., https://yourserver.com/webhook/a)"
       - name: OWNER_IDS_A
-        description: "Comma-separated Telegram user IDs for Bot A owners"
+        description: "Comma-separated Telegram user IDs for Bot A owners (e.g., 123456789,987654321)"
       - name: ALLOWED_USERS_A
         description: "Comma-separated allowed user IDs for Bot A"
       
@@ -32,7 +27,7 @@ services:
         description: "Telegram Bot Token for Bot B from @BotFather"
         secret: true
       - name: WEBHOOK_URL_B
-        description: "Full webhook URL for Bot B"
+        description: "Full webhook URL for Bot B (e.g., https://yourserver.com/webhook/b)"
       - name: OWNER_IDS_B
         description: "Comma-separated Telegram user IDs for Bot B owners"
       - name: ALLOWED_USERS_B
@@ -43,13 +38,13 @@ services:
         description: "Telegram Bot Token for Bot C from @BotFather"
         secret: true
       - name: WEBHOOK_URL_C
-        description: "Full webhook URL for Bot C"
+        description: "Full webhook URL for Bot C (e.g., https://yourserver.com/webhook/c)"
       - name: OWNER_IDS_C
         description: "Comma-separated Telegram user IDs for Bot C owners"
       - name: ALLOWED_USERS_C
         description: "Comma-separated allowed user IDs for Bot C"
       
-      # Database paths for SQLite fallback
+      # Database paths for each bot (with /tmp fix applied to all)
       - name: DB_PATH_A
         value: "/tmp/botdata_a.sqlite3"
       - name: DB_PATH_B

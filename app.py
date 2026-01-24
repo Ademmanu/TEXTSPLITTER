@@ -16,9 +16,6 @@ from flask import Flask, request, jsonify
 import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from sqlalchemy import create_engine, text
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,15 +39,7 @@ def parse_id_list(raw: str) -> List[int]:
             continue
     return ids
 
-def get_db_connection_string():
-    """Get PostgreSQL connection string from environment"""
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        # Fallback to SQLite for local development
-        return None
-    return database_url
-
-# Configuration for all three bots
+# Configuration for all three bots - DEFAULT ALL PATHS TO /tmp/
 BOTS_CONFIG = {
     "bot_a": {
         "name": "Bot A",
@@ -115,7 +104,6 @@ for bot_id in BOTS_CONFIG:
 BOT_STATES = {
     bot_id: {
         "db_conn": None,
-        "db_type": None,  # 'postgresql' or 'sqlite'
         "db_lock": threading.RLock(),
         "user_workers": {},
         "user_workers_lock": threading.Lock(),
@@ -167,187 +155,86 @@ def label_for_owner_view(bot_id: str, target_id: int, target_username: str) -> s
 
 # ===================== DATABASE =====================
 
-def create_bot_schema_postgresql(bot_id: str, conn):
-    """Create schema for a specific bot in PostgreSQL"""
+def _ensure_db_parent(dirpath: str):
     try:
-        with conn.cursor() as c:
-            # Create schema if not exists
-            c.execute(f"CREATE SCHEMA IF NOT EXISTS {bot_id}")
-            
-            # Set search path to bot's schema
-            c.execute(f"SET search_path TO {bot_id}")
-            
-            # Create tables
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                added_at TIMESTAMP
-            )
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                username TEXT,
-                text TEXT,
-                words_json TEXT,
-                total_words INTEGER,
-                sent_count INTEGER DEFAULT 0,
-                status TEXT,
-                created_at TIMESTAMP,
-                started_at TIMESTAMP,
-                finished_at TIMESTAMP,
-                last_activity TIMESTAMP,
-                retry_count INTEGER DEFAULT 0
-            )
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS split_logs (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                username TEXT,
-                words INTEGER,
-                created_at TIMESTAMP
-            )
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS sent_messages (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT,
-                message_id BIGINT,
-                sent_at TIMESTAMP,
-                deleted BOOLEAN DEFAULT FALSE
-            )
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS suspended_users (
-                user_id BIGINT PRIMARY KEY,
-                suspended_until TIMESTAMP,
-                reason TEXT,
-                added_at TIMESTAMP
-            )
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS send_failures (
-                user_id BIGINT PRIMARY KEY,
-                failures INTEGER,
-                last_failure_at TIMESTAMP,
-                notified BOOLEAN DEFAULT FALSE,
-                last_error_code INTEGER,
-                last_error_desc TEXT
-            )
-            """)
-            
-        conn.commit()
-        logger.info(f"PostgreSQL schema created for {bot_id}")
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
     except Exception as e:
-        logger.exception(f"Failed to create PostgreSQL schema for {bot_id}: {e}")
-        raise
-
-def _create_schema_sqlite(conn):
-    """Create SQLite schema"""
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS allowed_users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        added_at TEXT
-    )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        text TEXT,
-        words_json TEXT,
-        total_words INTEGER,
-        sent_count INTEGER DEFAULT 0,
-        status TEXT,
-        created_at TEXT,
-        started_at TEXT,
-        finished_at TEXT,
-        last_activity TEXT,
-        retry_count INTEGER DEFAULT 0
-    )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS split_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        words INTEGER,
-        created_at TEXT
-    )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sent_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        message_id INTEGER,
-        sent_at TEXT,
-        deleted INTEGER DEFAULT 0
-    )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS suspended_users (
-        user_id INTEGER PRIMARY KEY,
-        suspended_until TEXT,
-        reason TEXT,
-        added_at TEXT
-    )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS send_failures (
-        user_id INTEGER PRIMARY KEY,
-        failures INTEGER,
-        last_failure_at TEXT,
-        notified INTEGER DEFAULT 0,
-        last_error_code INTEGER,
-        last_error_desc TEXT
-    )""")
-    conn.commit()
+        logger.warning("Could not create DB parent directory %s: %s", dirpath, e)
 
 def init_db(bot_id: str):
-    """Initialize database for a specific bot - PostgreSQL or SQLite"""
+    """Initialize database for a specific bot - SIMPLIFIED VERSION"""
     config = BOTS_CONFIG[bot_id]
     state = BOT_STATES[bot_id]
     
-    # Try PostgreSQL first if DATABASE_URL is available
-    database_url = get_db_connection_string()
-    
-    if database_url:
-        try:
-            logger.info(f"Initializing PostgreSQL for {bot_id}")
-            conn = psycopg2.connect(
-                database_url,
-                cursor_factory=RealDictCursor
-            )
-            
-            # Create schema for this bot
-            create_bot_schema_postgresql(bot_id, conn)
-            
-            # Store connection with schema context
-            state["db_conn"] = conn
-            state["db_type"] = "postgresql"
-            logger.info(f"PostgreSQL initialized for {bot_id} with schema {bot_id}")
-            return
-            
-        except Exception as e:
-            logger.exception(f"Failed to initialize PostgreSQL for {bot_id}, falling back to SQLite: {e}")
-    
-    # Fallback to SQLite
-    logger.info(f"Using SQLite for {bot_id}")
+    # Get the db_path from config (already defaults to /tmp/)
     db_path = config["db_path"]
     
     # Log the path we're using
-    logger.info("Initializing SQLite DB for %s at %s", bot_id, db_path)
+    logger.info("Initializing DB for %s at %s", bot_id, db_path)
     
     # If path doesn't start with /tmp/, log a warning but continue
     if not db_path.startswith("/tmp/") and db_path != ":memory:":
         logger.warning("DB path for %s is not in /tmp/: %s", bot_id, db_path)
     
+    def _create_schema(conn):
+        c = conn.cursor()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            added_at TEXT
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            text TEXT,
+            words_json TEXT,
+            total_words INTEGER,
+            sent_count INTEGER DEFAULT 0,
+            status TEXT,
+            created_at TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            last_activity TEXT,
+            retry_count INTEGER DEFAULT 0
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS split_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            words INTEGER,
+            created_at TEXT
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS sent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            message_id INTEGER,
+            sent_at TEXT,
+            deleted INTEGER DEFAULT 0
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS suspended_users (
+            user_id INTEGER PRIMARY KEY,
+            suspended_until TEXT,
+            reason TEXT,
+            added_at TEXT
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS send_failures (
+            user_id INTEGER PRIMARY KEY,
+            failures INTEGER,
+            last_failure_at TEXT,
+            notified INTEGER DEFAULT 0,
+            last_error_code INTEGER,
+            last_error_desc TEXT
+        )""")
+        conn.commit()
+
     try:
         # Try to create parent directory if it doesn't exist
         parent_dir = os.path.dirname(db_path)
@@ -364,12 +251,11 @@ def init_db(bot_id: str):
         conn.execute("PRAGMA cache_size=-2000;")
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA busy_timeout=30000;")
-        _create_schema_sqlite(conn)
+        _create_schema(conn)
         state["db_conn"] = conn
-        state["db_type"] = "sqlite"
-        logger.info("SQLite DB initialized for %s at %s", bot_id, db_path)
+        logger.info("DB initialized for %s at %s", bot_id, db_path)
     except Exception as e:
-        logger.exception("Failed to open SQLite DB for %s at %s, falling back to in-memory DB: %s", bot_id, db_path, e)
+        logger.exception("Failed to open DB for %s at %s, falling back to in-memory DB: %s", bot_id, db_path, e)
         try:
             conn = sqlite3.connect(":memory:", timeout=30, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -378,117 +264,16 @@ def init_db(bot_id: str):
             conn.execute("PRAGMA cache_size=-2000;")
             conn.execute("PRAGMA foreign_keys=ON;")
             conn.execute("PRAGMA busy_timeout=30000;")
-            _create_schema_sqlite(conn)
+            _create_schema(conn)
             state["db_conn"] = conn
-            state["db_type"] = "sqlite"
-            logger.info("In-memory SQLite DB initialized for %s", bot_id)
+            logger.info("In-memory DB initialized for %s", bot_id)
         except Exception:
             state["db_conn"] = None
-            state["db_type"] = None
             logger.exception("Failed to initialize in-memory DB for %s", bot_id)
 
-def execute_query(bot_id: str, query: str, params=None, fetchone=False, fetchall=False, commit=True):
-    """Execute a query with bot-specific schema"""
-    state = BOT_STATES[bot_id]
-    
-    if not state["db_conn"]:
-        return None
-    
-    with state["db_lock"]:
-        try:
-            if state.get("db_type") == "postgresql":
-                # Set schema for PostgreSQL
-                with state["db_conn"].cursor() as cursor:
-                    cursor.execute(f"SET search_path TO {bot_id}")
-                    
-                    if params:
-                        cursor.execute(query, params)
-                    else:
-                        cursor.execute(query)
-                    
-                    if fetchone:
-                        result = cursor.fetchone()
-                        if result:
-                            # Convert RealDictRow to dict
-                            return dict(result)
-                        return None
-                    elif fetchall:
-                        results = cursor.fetchall()
-                        return [dict(row) for row in results]
-                    else:
-                        if commit:
-                            state["db_conn"].commit()
-                        return cursor.rowcount if cursor.rowcount else True
-            else:
-                # SQLite
-                cursor = state["db_conn"].cursor()
-                if params:
-                    cursor.execute(query, params)
-                else:
-                    cursor.execute(query)
-                    
-                if fetchone:
-                    return cursor.fetchone()
-                elif fetchall:
-                    return cursor.fetchall()
-                else:
-                    if commit:
-                        state["db_conn"].commit()
-                    return cursor.rowcount if cursor.rowcount else True
-                    
-        except Exception as e:
-            logger.exception(f"Database error for {bot_id}: {e}")
-            try:
-                state["db_conn"].rollback()
-            except Exception:
-                pass
-            return None
-
-def check_db_health(bot_id: str) -> bool:
-    """Check if database connection is healthy"""
-    state = BOT_STATES[bot_id]
-    if not state["db_conn"]:
-        return False
-    
-    try:
-        if state.get("db_type") == "postgresql":
-            # PostgreSQL health check
-            with state["db_lock"]:
-                with state["db_conn"].cursor() as c:
-                    c.execute(f"SET search_path TO {bot_id}")
-                    c.execute("SELECT 1")
-                    c.fetchone()
-            return True
-        else:
-            # SQLite health check
-            with state["db_lock"]:
-                c = state["db_conn"].cursor()
-                c.execute("SELECT 1")
-                c.fetchone()
-            return True
-    except Exception:
-        logger.warning("DB health check failed for %s, attempting reconnect", bot_id)
-        try:
-            if state["db_conn"]:
-                state["db_conn"].close()
-        except Exception:
-            pass
-        
-        # Try to reconnect
-        try:
-            init_db(bot_id)
-            return state["db_conn"] is not None
-        except Exception:
-            logger.exception("Failed to reconnect DB for %s", bot_id)
-            return False
-
 def ensure_send_failures_columns(bot_id: str):
-    """Ensure migration for a specific bot - SQLite only"""
+    """Ensure migration for a specific bot"""
     state = BOT_STATES[bot_id]
-    if state.get("db_type") == "postgresql":
-        # PostgreSQL schema already has all columns
-        return
-    
     try:
         with state["db_lock"]:
             c = state["db_conn"].cursor()
@@ -510,6 +295,34 @@ def ensure_send_failures_columns(bot_id: str):
     except Exception:
         logger.exception("ensure_send_failures_columns failed for %s", bot_id)
 
+def check_db_health(bot_id: str) -> bool:
+    """Check if database connection is healthy"""
+    state = BOT_STATES[bot_id]
+    if not state["db_conn"]:
+        return False
+    
+    try:
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT 1")
+            c.fetchone()
+        return True
+    except Exception:
+        logger.warning("DB health check failed for %s, attempting reconnect", bot_id)
+        try:
+            if state["db_conn"]:
+                state["db_conn"].close()
+        except Exception:
+            pass
+        
+        # Try to reconnect
+        try:
+            init_db(bot_id)
+            return state["db_conn"] is not None
+        except Exception:
+            logger.exception("Failed to reconnect DB for %s", bot_id)
+            return False
+
 # Initialize databases for all bots
 for bot_id in BOTS_CONFIG:
     init_db(bot_id)
@@ -520,14 +333,14 @@ for bot_id in BOTS_CONFIG:
     config = BOTS_CONFIG[bot_id]
     for oid in config["owner_ids"]:
         try:
-            if state := BOT_STATES[bot_id]:
-                result = execute_query(bot_id, 
-                    "SELECT 1 FROM allowed_users WHERE user_id = %s", 
-                    (oid,), fetchone=True)
-                if not result:
-                    execute_query(bot_id,
-                        "INSERT INTO allowed_users (user_id, username, added_at) VALUES (%s, %s, %s)",
-                        (oid, "", now_ts()))
+            with BOT_STATES[bot_id]["db_lock"]:
+                c = BOT_STATES[bot_id]["db_conn"].cursor()
+                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (oid,))
+                exists = c.fetchone()
+                if not exists:
+                    c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", 
+                              (oid, "", now_ts()))
+                    BOT_STATES[bot_id]["db_conn"].commit()
         except Exception:
             logger.exception("Error ensuring owner in allowed_users for %s", bot_id)
     
@@ -536,20 +349,21 @@ for bot_id in BOTS_CONFIG:
         if uid in config["owner_ids"]:
             continue
         try:
-            result = execute_query(bot_id,
-                "SELECT 1 FROM allowed_users WHERE user_id = %s",
-                (uid,), fetchone=True)
-            if not result:
-                execute_query(bot_id,
-                    "INSERT INTO allowed_users (user_id, username, added_at) VALUES (%s, %s, %s)",
-                    (uid, "", now_ts()))
-                try:
-                    if config["telegram_api"]:
-                        get_session(bot_id).post(f"{config['telegram_api']}/sendMessage", json={
-                            "chat_id": uid, "text": "✅ You have been added. Send any text to start."
-                        }, timeout=3)
-                except Exception:
-                    pass
+            with BOT_STATES[bot_id]["db_lock"]:
+                c = BOT_STATES[bot_id]["db_conn"].cursor()
+                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,))
+                rows = c.fetchone()
+                if not rows:
+                    c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)",
+                              (uid, "", now_ts()))
+                    BOT_STATES[bot_id]["db_conn"].commit()
+            try:
+                if config["telegram_api"]:
+                    get_session(bot_id).post(f"{config['telegram_api']}/sendMessage", json={
+                        "chat_id": uid, "text": "✅ You have been added. Send any text to start."
+                    }, timeout=3)
+            except Exception:
+                pass
         except Exception:
             logger.exception("Auto-add allowed user error for %s", bot_id)
 
@@ -722,22 +536,21 @@ def record_failure(bot_id: str, user_id: int, inc: int = 1, error_code: int = No
         return
     
     try:
-        result = execute_query(bot_id,
-            "SELECT failures, notified FROM send_failures WHERE user_id = %s",
-            (user_id,), fetchone=True)
-        
-        if not result:
-            failures = inc
-            notified = 0
-            execute_query(bot_id,
-                "INSERT INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (%s, %s, %s, %s, %s, %s)",
-                (user_id, failures, now_ts(), 0, error_code, description))
-        else:
-            failures = int(result.get('failures', 0) or 0) + inc
-            notified = int(result.get('notified', 0) or 0)
-            execute_query(bot_id,
-                "UPDATE send_failures SET failures = %s, last_failure_at = %s, last_error_code = %s, last_error_desc = %s WHERE user_id = %s",
-                (failures, now_ts(), error_code, description, user_id))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT failures, notified FROM send_failures WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            if not row:
+                failures = inc
+                notified = 0
+                c.execute("INSERT INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (?, ?, ?, ?, ?, ?)",
+                          (user_id, failures, now_ts(), 0, error_code, description))
+            else:
+                failures = int(row[0] or 0) + inc
+                notified = int(row[1] or 0)
+                c.execute("UPDATE send_failures SET failures = ?, last_failure_at = ?, last_error_code = ?, last_error_desc = ? WHERE user_id = ?",
+                          (failures, now_ts(), error_code, description, user_id))
+            state["db_conn"].commit()
 
         if is_permanent or is_permanent_telegram_error(error_code or 0, description):
             mark_user_permanently_unreachable(bot_id, user_id, error_code, description)
@@ -745,9 +558,10 @@ def record_failure(bot_id: str, user_id: int, inc: int = 1, error_code: int = No
 
         if failures >= SHARED_SETTINGS["failure_notify_threshold"] and notified == 0:
             try:
-                execute_query(bot_id,
-                    "UPDATE send_failures SET notified = 1 WHERE user_id = %s",
-                    (user_id,))
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("UPDATE send_failures SET notified = 1 WHERE user_id = ?", (user_id,))
+                    state["db_conn"].commit()
             except Exception:
                 logger.exception("Failed to set notified flag for %s in %s", user_id, bot_id)
             notify_owners(bot_id, f"⚠️ Repeated send failures for {user_id} ({failures}). Stopping their tasks. 🛑")
@@ -756,13 +570,15 @@ def record_failure(bot_id: str, user_id: int, inc: int = 1, error_code: int = No
         logger.exception("record_failure error for %s in %s", user_id, bot_id)
 
 def reset_failures(bot_id: str, user_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return
     
     try:
-        execute_query(bot_id,
-            "DELETE FROM send_failures WHERE user_id = %s",
-            (user_id,))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("DELETE FROM send_failures WHERE user_id = ?", (user_id,))
+            state["db_conn"].commit()
     except Exception:
         logger.exception("reset_failures failed for %s in %s", user_id, bot_id)
 
@@ -775,18 +591,19 @@ def mark_user_permanently_unreachable(bot_id: str, user_id: int, error_code: int
     
     try:
         if user_id in config["owner_ids"]:
-            execute_query(bot_id,
-                "INSERT INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (%s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (user_id) DO UPDATE SET failures = %s, last_failure_at = %s, notified = %s, last_error_code = %s, last_error_desc = %s",
-                (user_id, SHARED_SETTINGS["failure_notify_threshold"], now_ts(), 1, error_code, description,
-                 SHARED_SETTINGS["failure_notify_threshold"], now_ts(), 1, error_code, description))
+            with state["db_lock"]:
+                c = state["db_conn"].cursor()
+                c.execute("INSERT OR REPLACE INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (?, ?, ?, ?, ?, ?)",
+                          (user_id, SHARED_SETTINGS["failure_notify_threshold"], now_ts(), 1, error_code, description))
+                state["db_conn"].commit()
             notify_owners(bot_id, f"⚠️ Repeated send failures for owner {user_id}. Please investigate. Error: {error_code} {description}")
             return
 
-        execute_query(bot_id,
-            "INSERT INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (%s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET failures = %s, last_failure_at = %s, notified = %s, last_error_code = %s, last_error_desc = %s",
-            (user_id, 999, now_ts(), 1, error_code, description, 999, now_ts(), 1, error_code, description))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("INSERT OR REPLACE INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (?, ?, ?, ?, ?, ?)",
+                      (user_id, 999, now_ts(), 1, error_code, description))
+            state["db_conn"].commit()
 
         cancel_active_task_for_user(bot_id, user_id)
         suspend_user(bot_id, user_id, SHARED_SETTINGS["permanent_suspend_days"] * 24 * 3600, 
@@ -871,9 +688,11 @@ def send_message(bot_id: str, chat_id: int, text: str, reply_markup: Optional[Di
             try:
                 mid = data["result"].get("message_id")
                 if mid:
-                    execute_query(bot_id,
-                        "INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (%s, %s, %s, %s)",
-                        (chat_id, mid, now_ts(), 0))
+                    with BOT_STATES[bot_id]["db_lock"]:
+                        c = BOT_STATES[bot_id]["db_conn"].cursor()
+                        c.execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",
+                                  (chat_id, mid, now_ts()))
+                        BOT_STATES[bot_id]["db_conn"].commit()
             except Exception:
                 logger.exception("record sent message failed for %s", bot_id)
             reset_failures(bot_id, chat_id)
@@ -927,99 +746,106 @@ def enqueue_task(bot_id: str, user_id: int, username: str, text: str):
         return {"ok": False, "reason": "empty"}
     
     try:
-        result = execute_query(bot_id,
-            "SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND status = 'queued'",
-            (user_id,), fetchone=True)
-        
-        pending = result.get('count', 0) if result else 0
-        if pending >= config["max_queue_per_user"]:
-            return {"ok": False, "reason": "queue_full", "queue_size": pending}
-        
-        execute_query(bot_id,
-            "INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at, sent_count, last_activity, retry_count) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0, now_ts(), 0))
-        
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+            pending = c.fetchone()[0]
+            if pending >= config["max_queue_per_user"]:
+                return {"ok": False, "reason": "queue_full", "queue_size": pending}
+            try:
+                c.execute("""INSERT INTO tasks (user_id, username, text, words_json, total_words, status, 
+                          created_at, sent_count, last_activity, retry_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0, now_ts(), 0))
+                state["db_conn"].commit()
+            except Exception:
+                logger.exception("enqueue_task db error for %s", bot_id)
+                return {"ok": False, "reason": "db_error"}
     except Exception:
-        logger.exception("enqueue_task db error for %s", bot_id)
         return {"ok": False, "reason": "db_error"}
     
     return {"ok": True, "total_words": total, "queue_size": pending + 1}
 
 def get_next_task_for_user(bot_id: str, user_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return None
     
     try:
-        result = execute_query(bot_id,
-            "SELECT id, words_json, total_words, text, retry_count FROM tasks WHERE user_id = %s AND status = 'queued' ORDER BY id ASC LIMIT 1",
-            (user_id,), fetchone=True)
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT id, words_json, total_words, text, retry_count FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
+            r = c.fetchone()
     except Exception:
         return None
     
-    if not result:
+    if not r:
         return None
-    return {"id": result['id'], "words": json.loads(result['words_json']) if result['words_json'] else split_text_to_words(result['text']), 
-            "total_words": result['total_words'], "text": result['text'], "retry_count": result.get('retry_count', 0)}
+    return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), 
+            "total_words": r[2], "text": r[3], "retry_count": r[4]}
 
 def set_task_status(bot_id: str, task_id: int, status: str):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return
     
     try:
-        if status == "running":
-            execute_query(bot_id,
-                "UPDATE tasks SET status = %s, started_at = %s, last_activity = %s WHERE id = %s",
-                (status, now_ts(), now_ts(), task_id))
-        elif status in ("done", "cancelled"):
-            execute_query(bot_id,
-                "UPDATE tasks SET status = %s, finished_at = %s, last_activity = %s WHERE id = %s",
-                (status, now_ts(), now_ts(), task_id))
-        else:
-            execute_query(bot_id,
-                "UPDATE tasks SET status = %s, last_activity = %s WHERE id = %s",
-                (status, now_ts(), task_id))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            if status == "running":
+                c.execute("UPDATE tasks SET status = ?, started_at = ?, last_activity = ? WHERE id = ?", 
+                          (status, now_ts(), now_ts(), task_id))
+            elif status in ("done", "cancelled"):
+                c.execute("UPDATE tasks SET status = ?, finished_at = ?, last_activity = ? WHERE id = ?", 
+                          (status, now_ts(), now_ts(), task_id))
+            else:
+                c.execute("UPDATE tasks SET status = ?, last_activity = ? WHERE id = ?", 
+                          (status, now_ts(), task_id))
+            state["db_conn"].commit()
     except Exception:
         logger.exception("set_task_status failed for %s in %s", task_id, bot_id)
 
 def update_task_activity(bot_id: str, task_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return
     
     try:
-        execute_query(bot_id,
-            "UPDATE tasks SET last_activity = %s WHERE id = %s",
-            (now_ts(), task_id))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("UPDATE tasks SET last_activity = ? WHERE id = ?", (now_ts(), task_id))
+            state["db_conn"].commit()
     except Exception:
         logger.exception("update_task_activity failed for %s in %s", task_id, bot_id)
 
 def increment_task_retry(bot_id: str, task_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return
     
     try:
-        execute_query(bot_id,
-            "UPDATE tasks SET retry_count = retry_count + 1, last_activity = %s WHERE id = %s",
-            (now_ts(), task_id))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("UPDATE tasks SET retry_count = retry_count + 1, last_activity = ? WHERE id = ?", (now_ts(), task_id))
+            state["db_conn"].commit()
     except Exception:
         logger.exception("increment_task_retry failed for %s in %s", task_id, bot_id)
 
 def cancel_active_task_for_user(bot_id: str, user_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return 0
     
     try:
-        result = execute_query(bot_id,
-            "SELECT id FROM tasks WHERE user_id = %s AND status IN ('queued','running','paused')",
-            (user_id,), fetchall=True)
-        
-        count = 0
-        for row in result:
-            tid = row['id'] if isinstance(row, dict) else row[0]
-            execute_query(bot_id,
-                "UPDATE tasks SET status = %s, finished_at = %s WHERE id = %s",
-                ("cancelled", now_ts(), tid))
-            count += 1
-        
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT id FROM tasks WHERE user_id = ? AND status IN ('queued','running','paused')", (user_id,))
+            rows = c.fetchall()
+            count = 0
+            for r in rows:
+                tid = r[0]
+                c.execute("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", ("cancelled", now_ts(), tid))
+                count += 1
+            state["db_conn"].commit()
     except Exception:
         return 0
     
@@ -1027,15 +853,17 @@ def cancel_active_task_for_user(bot_id: str, user_id: int):
     return count
 
 def record_split_log(bot_id: str, user_id: int, username: str, count: int = 1):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return
     
     try:
-        now = now_ts()
-        for _ in range(count):
-            execute_query(bot_id,
-                "INSERT INTO split_logs (user_id, username, words, created_at) VALUES (%s, %s, %s, %s)",
-                (user_id, username, 1, now))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            now = now_ts()
+            entries = [(user_id, username, 1, now) for _ in range(count)]
+            c.executemany("INSERT INTO split_logs (user_id, username, words, created_at) VALUES (?, ?, ?, ?)", entries)
+            state["db_conn"].commit()
     except Exception:
         logger.exception("record_split_log error for %s", bot_id)
 
@@ -1043,6 +871,7 @@ def record_split_log(bot_id: str, user_id: int, username: str, count: int = 1):
 
 def is_allowed(bot_id: str, user_id: int) -> bool:
     config = BOTS_CONFIG[bot_id]
+    state = BOT_STATES[bot_id]
     
     if user_id in config["owner_ids"]:
         return True
@@ -1051,15 +880,16 @@ def is_allowed(bot_id: str, user_id: int) -> bool:
         return False
     
     try:
-        result = execute_query(bot_id,
-            "SELECT 1 FROM allowed_users WHERE user_id = %s",
-            (user_id,), fetchone=True)
-        return bool(result)
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
+            return bool(c.fetchone())
     except Exception:
         return False
 
 def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
     config = BOTS_CONFIG[bot_id]
+    state = BOT_STATES[bot_id]
     
     if not check_db_health(bot_id):
         return
@@ -1067,10 +897,11 @@ def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
     until_utc_str = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
     until_wat_str = utc_to_wat_ts(until_utc_str)
     try:
-        execute_query(bot_id,
-            "INSERT INTO suspended_users (user_id, suspended_until, reason, added_at) VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET suspended_until = %s, reason = %s, added_at = %s",
-            (target_id, until_utc_str, reason, now_ts(), until_utc_str, reason, now_ts()))
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("INSERT OR REPLACE INTO suspended_users (user_id, suspended_until, reason, added_at) VALUES (?, ?, ?, ?)",
+                      (target_id, until_utc_str, reason, now_ts()))
+            state["db_conn"].commit()
     except Exception:
         logger.exception("suspend_user db error for %s", bot_id)
     
@@ -1085,20 +916,19 @@ def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
 
 def unsuspend_user(bot_id: str, target_id: int) -> bool:
     config = BOTS_CONFIG[bot_id]
+    state = BOT_STATES[bot_id]
     
     if not check_db_health(bot_id):
         return False
     
-    result = execute_query(bot_id,
-        "SELECT suspended_until FROM suspended_users WHERE user_id = %s",
-        (target_id,), fetchone=True)
-    
-    if not result:
-        return False
-    
-    execute_query(bot_id,
-        "DELETE FROM suspended_users WHERE user_id = %s",
-        (target_id,))
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (target_id,))
+        r = c.fetchone()
+        if not r:
+            return False
+        c.execute("DELETE FROM suspended_users WHERE user_id = ?", (target_id,))
+        state["db_conn"].commit()
     
     try:
         send_message(bot_id, target_id, f"✅ You have been unsuspended by {config['owner_tag']}.")
@@ -1109,28 +939,18 @@ def unsuspend_user(bot_id: str, target_id: int) -> bool:
     return True
 
 def list_suspended(bot_id: str):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return []
     
-    result = execute_query(bot_id,
-        "SELECT user_id, suspended_until, reason, added_at FROM suspended_users ORDER BY suspended_until ASC",
-        fetchall=True)
-    
-    if not result:
-        return []
-    
-    # Convert to list of tuples for compatibility
-    rows = []
-    for row in result:
-        if isinstance(row, dict):
-            rows.append((row['user_id'], row['suspended_until'], row['reason'], row['added_at']))
-        else:
-            rows.append(row)
-    
-    return rows
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT user_id, suspended_until, reason, added_at FROM suspended_users ORDER BY suspended_until ASC")
+        return c.fetchall()
 
 def is_suspended(bot_id: str, user_id: int) -> bool:
     config = BOTS_CONFIG[bot_id]
+    state = BOT_STATES[bot_id]
     
     if user_id in config["owner_ids"]:
         return False
@@ -1138,16 +958,16 @@ def is_suspended(bot_id: str, user_id: int) -> bool:
     if not check_db_health(bot_id):
         return False
     
-    result = execute_query(bot_id,
-        "SELECT suspended_until FROM suspended_users WHERE user_id = %s",
-        (user_id,), fetchone=True)
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (user_id,))
+        r = c.fetchone()
     
-    if not result:
+    if not r:
         return False
     
     try:
-        until_str = result.get('suspended_until') if isinstance(result, dict) else result[0]
-        until = datetime.strptime(until_str, "%Y-%m-%d %H:%M:%S")
+        until = datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
         return until > datetime.utcnow()
     except Exception:
         return False
@@ -1264,40 +1084,36 @@ def check_stuck_tasks(bot_id: str):
     """Check for stuck tasks for a specific bot"""
     try:
         cutoff = (datetime.utcnow() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
+        state = BOT_STATES[bot_id]
         
         if not check_db_health(bot_id):
             return
         
-        result = execute_query(bot_id,
-            "SELECT id, user_id, status, retry_count FROM tasks WHERE status = 'running' AND last_activity < %s",
-            (cutoff,), fetchall=True)
-        
-        for row in result:
-            task_id = row['id'] if isinstance(row, dict) else row[0]
-            user_id = row['user_id'] if isinstance(row, dict) else row[1]
-            status = row['status'] if isinstance(row, dict) else row[2]
-            retry_count = row['retry_count'] if isinstance(row, dict) else row[3]
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT id, user_id, status, retry_count FROM tasks WHERE status = 'running' AND last_activity < ?", (cutoff,))
+            stuck_tasks = c.fetchall()
             
-            logger.warning(f"Stuck task detected in {bot_id}: task_id={task_id}, user_id={user_id}, status={status}, retry_count={retry_count}")
+            for task_id, user_id, status, retry_count in stuck_tasks:
+                logger.warning(f"Stuck task detected in {bot_id}: task_id={task_id}, user_id={user_id}, status={status}, retry_count={retry_count}")
+                
+                if retry_count < 3:
+                    c.execute("UPDATE tasks SET status = 'queued', retry_count = retry_count + 1, last_activity = ? WHERE id = ?", 
+                              (now_ts(), task_id))
+                    logger.info(f"Reset stuck task {task_id} to queued in {bot_id} (retry {retry_count + 1})")
+                    notify_user_worker(bot_id, user_id)
+                else:
+                    c.execute("UPDATE tasks SET status = 'cancelled', finished_at = ? WHERE id = ?", 
+                              (now_ts(), task_id))
+                    logger.info(f"Cancelled stuck task {task_id} in {bot_id} after {retry_count} retries")
+                    try:
+                        send_message(bot_id, user_id, f"🛑 Your task was cancelled after multiple failures. Please try again.")
+                    except Exception:
+                        pass
             
-            if retry_count < 3:
-                execute_query(bot_id,
-                    "UPDATE tasks SET status = 'queued', retry_count = retry_count + 1, last_activity = %s WHERE id = %s",
-                    (now_ts(), task_id))
-                logger.info(f"Reset stuck task {task_id} to queued in {bot_id} (retry {retry_count + 1})")
-                notify_user_worker(bot_id, user_id)
-            else:
-                execute_query(bot_id,
-                    "UPDATE tasks SET status = 'cancelled', finished_at = %s WHERE id = %s",
-                    (now_ts(), task_id))
-                logger.info(f"Cancelled stuck task {task_id} in {bot_id} after {retry_count} retries")
-                try:
-                    send_message(bot_id, user_id, f"🛑 Your task was cancelled after multiple failures. Please try again.")
-                except Exception:
-                    pass
-        
-        if result:
-            logger.info(f"Cleaned up {len(result)} stuck tasks in {bot_id}")
+            if stuck_tasks:
+                state["db_conn"].commit()
+                logger.info(f"Cleaned up {len(stuck_tasks)} stuck tasks in {bot_id}")
     except Exception:
         logger.exception("Error checking for stuck tasks in %s", bot_id)
 
@@ -1341,14 +1157,14 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
             total = int(task["total_words"] or len(words))
             retry_count = task.get("retry_count", 0)
 
-            result = execute_query(bot_id,
-                "SELECT sent_count, status FROM tasks WHERE id = %s",
-                (task_id,), fetchone=True)
+            with state["db_lock"]:
+                c = state["db_conn"].cursor()
+                c.execute("SELECT sent_count, status FROM tasks WHERE id = ?", (task_id,))
+                sent_info = c.fetchone()
 
-            if not result or result.get('status') == "cancelled":
+            if not sent_info or sent_info[1] == "cancelled":
                 continue
 
-            sent_info = result
             update_task_activity(bot_id, task_id)
             update_worker_heartbeat(bot_id, user_id)
 
@@ -1362,26 +1178,27 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                     break
                 update_task_activity(bot_id, task_id)
                 update_worker_heartbeat(bot_id, user_id)
-                result = execute_query(bot_id,
-                    "SELECT status FROM tasks WHERE id = %s",
-                    (task_id,), fetchone=True)
-                if not result or result.get('status') == "cancelled":
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                    row_check = c.fetchone()
+                if not row_check or row_check[0] == "cancelled":
                     break
 
             if not semaphore_acquired:
                 continue
 
-            result = execute_query(bot_id,
-                "SELECT sent_count, status FROM tasks WHERE id = %s",
-                (task_id,), fetchone=True)
-            
-            if not result or result.get('status') == "cancelled":
+            with state["db_lock"]:
+                c = state["db_conn"].cursor()
+                c.execute("SELECT sent_count, status FROM tasks WHERE id = ?", (task_id,))
+                sent_info = c.fetchone()
+            if not sent_info or sent_info[1] == "cancelled":
                 if acquired_semaphore:
                     state["active_workers_semaphore"].release()
                     acquired_semaphore = False
                 continue
 
-            sent = int(sent_info.get('sent_count', 0) or 0)
+            sent = int(sent_info[0] or 0)
             set_task_status(bot_id, task_id, "running")
             update_worker_heartbeat(bot_id, user_id)
 
@@ -1423,12 +1240,13 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                     update_task_activity(bot_id, task_id)
                     last_activity_update = current_time
                 
-                result = execute_query(bot_id,
-                    "SELECT status FROM tasks WHERE id = %s",
-                    (task_id,), fetchone=True)
-                if not result:
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                    row = c.fetchone()
+                if not row:
                     break
-                status = result.get('status') if isinstance(result, dict) else result[0]
+                status = row[0]
                 if status == "cancelled" or is_suspended(bot_id, user_id):
                     break
 
@@ -1443,12 +1261,13 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                         update_worker_heartbeat(bot_id, user_id)
                         if stop_event.is_set():
                             break
-                        result = execute_query(bot_id,
-                            "SELECT status FROM tasks WHERE id = %s",
-                            (task_id,), fetchone=True)
-                        if not result or (result.get('status') if isinstance(result, dict) else result[0]) == "cancelled" or is_suspended(bot_id, user_id):
+                        with state["db_lock"]:
+                            c_check = state["db_conn"].cursor()
+                            c_check.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                            row2 = c_check.fetchone()
+                        if not row2 or row2[0] == "cancelled" or is_suspended(bot_id, user_id):
                             break
-                        if (result.get('status') if isinstance(result, dict) else result[0]) == "running":
+                        if row2[0] == "running":
                             try:
                                 send_message(bot_id, user_id, "▶️ Resuming your task now.")
                             except Exception:
@@ -1467,8 +1286,8 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                         break
 
                 try:
-                    result_send = send_message(bot_id, user_id, words[i])
-                    if result_send:
+                    result = send_message(bot_id, user_id, words[i])
+                    if result:
                         consecutive_errors = 0
                         record_split_log(bot_id, user_id, uname_for_stat, 1)
                     else:
@@ -1496,9 +1315,10 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                 i += 1
 
                 try:
-                    execute_query(bot_id,
-                        "UPDATE tasks SET sent_count = %s, last_activity = %s WHERE id = %s",
-                        (i, now_ts(), task_id))
+                    with state["db_lock"]:
+                        c = state["db_conn"].cursor()
+                        c.execute("UPDATE tasks SET sent_count = ?, last_activity = ? WHERE id = ?", (i, now_ts(), task_id))
+                        state["db_conn"].commit()
                 except Exception:
                     logger.exception("Failed to update sent_count for task %s in %s", task_id, bot_id)
 
@@ -1516,11 +1336,12 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                 if is_suspended(bot_id, user_id):
                     break
 
-            result = execute_query(bot_id,
-                "SELECT status, sent_count FROM tasks WHERE id = %s",
-                (task_id,), fetchone=True)
+            with state["db_lock"]:
+                c = state["db_conn"].cursor()
+                c.execute("SELECT status, sent_count FROM tasks WHERE id = ?", (task_id,))
+                r = c.fetchone()
 
-            final_status = result.get('status') if result else "done"
+            final_status = r[0] if r else "done"
             if final_status not in ("cancelled", "paused"):
                 set_task_status(bot_id, task_id, "done")
                 try:
@@ -1559,60 +1380,56 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
 # ===================== STATISTICS =====================
 
 def fetch_display_username(bot_id: str, user_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return ""
     
-    result = execute_query(bot_id,
-        "SELECT username FROM split_logs WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
-        (user_id,), fetchone=True)
-    
-    if result and result.get('username'):
-        return result['username']
-    
-    result = execute_query(bot_id,
-        "SELECT username FROM allowed_users WHERE user_id = %s",
-        (user_id,), fetchone=True)
-    
-    if result and result.get('username'):
-        return result['username']
-    
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT username FROM split_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
+        r = c.fetchone()
+        if r and r[0]:
+            return r[0]
+        c.execute("SELECT username FROM allowed_users WHERE user_id = ?", (user_id,))
+        r2 = c.fetchone()
+        if r2 and r2[0]:
+            return r2[0]
     return ""
 
 def compute_last_hour_stats(bot_id: str):
     cutoff = datetime.utcnow() - timedelta(hours=1)
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return []
     
-    result = execute_query(bot_id,
-        """
-        SELECT user_id, username, COUNT(*) as s
-        FROM split_logs
-        WHERE created_at >= %s
-        GROUP BY user_id, username
-        ORDER BY s DESC
-        """,
-        (cutoff.strftime("%Y-%m-%d %H:%M:%S"),), fetchall=True)
-    
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("""
+            SELECT user_id, username, COUNT(*) as s
+            FROM split_logs
+            WHERE created_at >= ?
+            GROUP BY user_id, username
+            ORDER BY s DESC
+        """, (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
+        rows = c.fetchall()
     stat_map = {}
-    for row in result:
-        uid = row['user_id'] if isinstance(row, dict) else row[0]
-        uname = row['username'] if isinstance(row, dict) else row[1]
-        s = row['s'] if isinstance(row, dict) else row[2]
+    for uid, uname, s in rows:
         stat_map[uid] = {"uname": uname, "words": stat_map.get(uid,{}).get("words",0)+int(s)}
     return [(k, v["uname"], v["words"]) for k, v in stat_map.items()]
 
 def compute_last_12h_stats(bot_id: str, user_id: int):
     cutoff = datetime.utcnow() - timedelta(hours=12)
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return 0
     
-    result = execute_query(bot_id,
-        """
-        SELECT COUNT(*) as count FROM split_logs WHERE user_id = %s AND created_at >= %s
-        """,
-        (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")), fetchone=True)
-    
-    return int(result.get('count', 0) or 0) if result else 0
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("""
+            SELECT COUNT(*) FROM split_logs WHERE user_id = ? AND created_at >= ?
+        """, (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+        r = c.fetchone()
+        return int(r[0] or 0)
 
 def send_hourly_owner_stats(bot_id: str):
     rows = compute_last_hour_stats(bot_id)
@@ -1636,39 +1453,39 @@ def send_hourly_owner_stats(bot_id: str):
             pass
 
 def check_and_lift(bot_id: str):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return
     
-    result = execute_query(bot_id,
-        "SELECT user_id, suspended_until FROM suspended_users",
-        fetchall=True)
-    
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT user_id, suspended_until FROM suspended_users")
+        rows = c.fetchall()
     now = datetime.utcnow()
-    for row in result:
+    for r in rows:
         try:
-            until_str = row['suspended_until'] if isinstance(row, dict) else row[1]
-            until = datetime.strptime(until_str, "%Y-%m-%d %H:%M:%S")
+            until = datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")
             if until <= now:
-                uid = row['user_id'] if isinstance(row, dict) else row[0]
+                uid = r[0]
                 unsuspend_user(bot_id, uid)
         except Exception:
-            logger.exception("suspend parse error for %s in %s", row, bot_id)
+            logger.exception("suspend parse error for %s in %s", r, bot_id)
 
 def prune_old_logs(bot_id: str):
     try:
         cutoff = (datetime.utcnow() - timedelta(days=SHARED_SETTINGS["log_retention_days"])).strftime("%Y-%m-%d %H:%M:%S")
+        state = BOT_STATES[bot_id]
         
         if not check_db_health(bot_id):
             return
         
-        deleted1 = execute_query(bot_id,
-            "DELETE FROM split_logs WHERE created_at < %s",
-            (cutoff,))
-        
-        deleted2 = execute_query(bot_id,
-            "DELETE FROM sent_messages WHERE sent_at < %s",
-            (cutoff,))
-        
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("DELETE FROM split_logs WHERE created_at < ?", (cutoff,))
+            deleted1 = c.rowcount
+            c.execute("DELETE FROM sent_messages WHERE sent_at < ?", (cutoff,))
+            deleted2 = c.rowcount
+            state["db_conn"].commit()
         if deleted1 or deleted2:
             logger.info("Pruned logs for %s: split_logs=%s sent_messages=%s", bot_id, deleted1, deleted2)
     except Exception:
@@ -1809,34 +1626,24 @@ def is_owner_in_operation(bot_id: str, user_id: int) -> bool:
 
 def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0) -> Tuple[List[Dict], int, int]:
     cutoff = datetime.utcnow() - timedelta(hours=hours)
+    state = BOT_STATES[bot_id]
     
     if not check_db_health(bot_id):
         return [], 0, 0
     
-    result = execute_query(bot_id,
-        """
-        SELECT id, text, created_at, total_words, sent_count
-        FROM tasks 
-        WHERE user_id = %s AND created_at >= %s
-        ORDER BY created_at DESC
-        """,
-        (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")), fetchall=True)
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("""
+            SELECT id, text, created_at, total_words, sent_count
+            FROM tasks 
+            WHERE user_id = ? AND created_at >= ?
+            ORDER BY created_at DESC
+        """, (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+        rows = c.fetchall()
     
     tasks = []
-    for row in result:
-        if isinstance(row, dict):
-            task_id = row['id']
-            text = row['text']
-            created_at = row['created_at']
-            total_words = row['total_words']
-            sent_count = row['sent_count']
-        else:
-            task_id = row[0]
-            text = row[1]
-            created_at = row[2]
-            total_words = row[3]
-            sent_count = row[4]
-        
+    for r in rows:
+        task_id, text, created_at, total_words, sent_count = r
         words = split_text_to_words(text)
         preview = " ".join(words[:2]) if len(words) >= 2 else words[0] if words else "(empty)"
         tasks.append({
@@ -1858,25 +1665,14 @@ def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0)
     return paginated_tasks, total_tasks, total_pages
 
 def get_all_users_ordered(bot_id: str):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return []
     
-    result = execute_query(bot_id,
-        "SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC",
-        fetchall=True)
-    
-    if not result:
-        return []
-    
-    # Convert to list of tuples for compatibility
-    rows = []
-    for row in result:
-        if isinstance(row, dict):
-            rows.append((row['user_id'], row['username'], row['added_at']))
-        else:
-            rows.append(row)
-    
-    return rows
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC")
+        return c.fetchall()
 
 def get_user_index(bot_id: str, user_id: int):
     users = get_all_users_ordered(bot_id)
@@ -1942,19 +1738,16 @@ def send_ownersets_menu(bot_id: str, owner_id: int):
 # ===================== COMMAND HANDLING =====================
 
 def get_user_task_counts(bot_id: str, user_id: int):
+    state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return 0, 0
     
-    result = execute_query(bot_id,
-        "SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND status IN ('running','paused')",
-        (user_id,), fetchone=True)
-    active = int(result.get('count', 0) or 0) if result else 0
-    
-    result = execute_query(bot_id,
-        "SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND status = 'queued'",
-        (user_id,), fetchone=True)
-    queued = int(result.get('count', 0) or 0) if result else 0
-    
+    with state["db_lock"]:
+        c = state["db_conn"].cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,))
+        active = int(c.fetchone()[0] or 0)
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+        queued = int(c.fetchone()[0] or 0)
     return active, queued
 
 def handle_command(bot_id: str, user_id: int, username: str, command: str, args: str):
@@ -2010,63 +1803,55 @@ def handle_command(bot_id: str, user_id: int, username: str, command: str, args:
         return jsonify({"ok": True})
 
     if command == "/pause":
+        state = BOT_STATES[bot_id]
         if not check_db_health(bot_id):
             send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
             return jsonify({"ok": True})
         
-        result = execute_query(bot_id,
-            "SELECT id FROM tasks WHERE user_id = %s AND status = 'running' ORDER BY started_at ASC LIMIT 1",
-            (user_id,), fetchone=True)
-        
-        if not result:
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,))
+            rows = c.fetchone()
+        if not rows:
             send_message(bot_id, user_id, "ℹ️ No active task to pause.")
             return jsonify({"ok": True})
-        
-        task_id = result['id'] if isinstance(result, dict) else result[0]
-        set_task_status(bot_id, task_id, "paused")
+        set_task_status(bot_id, rows[0], "paused")
         notify_user_worker(bot_id, user_id)
         send_message(bot_id, user_id, "⏸️ Paused. Use /resume to continue.")
         return jsonify({"ok": True})
 
     if command == "/resume":
+        state = BOT_STATES[bot_id]
         if not check_db_health(bot_id):
             send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
             return jsonify({"ok": True})
         
-        result = execute_query(bot_id,
-            "SELECT id FROM tasks WHERE user_id = %s AND status = 'paused' ORDER BY started_at ASC LIMIT 1",
-            (user_id,), fetchone=True)
-        
-        if not result:
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,))
+            rows = c.fetchone()
+        if not rows:
             send_message(bot_id, user_id, "ℹ️ No paused task to resume.")
             return jsonify({"ok": True})
-        
-        task_id = result['id'] if isinstance(result, dict) else result[0]
-        set_task_status(bot_id, task_id, "running")
+        set_task_status(bot_id, rows[0], "running")
         notify_user_worker(bot_id, user_id)
         send_message(bot_id, user_id, "▶️ Resuming your task now.")
         return jsonify({"ok": True})
 
     if command == "/status":
+        state = BOT_STATES[bot_id]
         if not check_db_health(bot_id):
             send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
             return jsonify({"ok": True})
         
-        result = execute_query(bot_id,
-            "SELECT id, status, total_words, sent_count FROM tasks WHERE user_id = %s AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1",
-            (user_id,), fetchone=True)
-        
-        result2 = execute_query(bot_id,
-            "SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND status = 'queued'",
-            (user_id,), fetchone=True)
-        
-        queued = result2.get('count', 0) if result2 else 0
-        
-        if result:
-            task_id = result['id'] if isinstance(result, dict) else result[0]
-            status = result['status'] if isinstance(result, dict) else result[1]
-            total = result['total_words'] if isinstance(result, dict) else result[2]
-            sent = result['sent_count'] if isinstance(result, dict) else result[3]
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT id, status, total_words, sent_count FROM tasks WHERE user_id = ? AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1", (user_id,))
+            active = c.fetchone()
+            c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+            queued = c.fetchone()[0]
+        if active:
+            aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
             send_message(bot_id, user_id, f"ℹ️ Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
         elif queued > 0:
@@ -2076,15 +1861,15 @@ def handle_command(bot_id: str, user_id: int, username: str, command: str, args:
         return jsonify({"ok": True})
 
     if command == "/stop":
+        state = BOT_STATES[bot_id]
         if not check_db_health(bot_id):
             send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
             return jsonify({"ok": True})
         
-        result = execute_query(bot_id,
-            "SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND status = 'queued'",
-            (user_id,), fetchone=True)
-        
-        queued = result.get('count', 0) if result else 0
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+            queued = c.fetchone()[0]
         stopped = cancel_active_task_for_user(bot_id, user_id)
         stop_user_worker(bot_id, user_id)
         if stopped > 0 or queued > 0:
@@ -2115,16 +1900,17 @@ def handle_user_text(bot_id: str, user_id: int, username: str, text: str):
         return jsonify({"ok": True})
     
     if is_suspended(bot_id, user_id):
+        state = BOT_STATES[bot_id]
         if not check_db_health(bot_id):
             send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
             return jsonify({"ok": True})
         
-        result = execute_query(bot_id,
-            "SELECT suspended_until FROM suspended_users WHERE user_id = %s",
-            (user_id,), fetchone=True)
-        
-        until_utc = result.get('suspended_until') if result else "unknown"
-        until_wat = utc_to_wat_ts(until_utc)
+        with state["db_lock"]:
+            c = state["db_conn"].cursor()
+            c.execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (user_id,))
+            r = c.fetchone()
+            until_utc = r[0] if r else "unknown"
+            until_wat = utc_to_wat_ts(until_utc)
         send_message(bot_id, user_id, f"⛔ You have been suspended until {until_wat} by {config['owner_tag']}.")
         return jsonify({"ok": True})
     
@@ -2211,32 +1997,25 @@ def handle_webhook(bot_id: str):
                     return jsonify({"ok": True})
                 
                 # Get bot-specific info
-                active_rows = execute_query(bot_id,
-                    "SELECT user_id, username, SUM(total_words - COALESCE(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id",
-                    fetchall=True)
-                
-                result = execute_query(bot_id,
-                    "SELECT COUNT(*) as count FROM tasks WHERE status = 'queued'",
-                    fetchone=True)
-                queued_tasks = result.get('count', 0) if result else 0
+                active_rows, queued_tasks = [], 0
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id")
+                    active_rows = c.fetchall()
+                    c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
+                    queued_tasks = c.fetchone()[0]
                 
                 queued_counts = {}
-                result = execute_query(bot_id,
-                    "SELECT user_id, COUNT(*) as count FROM tasks WHERE status = 'queued' GROUP BY user_id",
-                    fetchall=True)
-                for row in result:
-                    user_id = row['user_id'] if isinstance(row, dict) else row[0]
-                    count = row['count'] if isinstance(row, dict) else row[1]
-                    queued_counts[user_id] = count
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("SELECT user_id, COUNT(*) FROM tasks WHERE status = 'queued' GROUP BY user_id")
+                    for row in c.fetchall():
+                        queued_counts[row[0]] = row[1]
                 
                 stats_rows = compute_last_hour_stats(bot_id)
                 lines_active = []
                 for r in active_rows:
-                    uid2 = r['user_id'] if isinstance(r, dict) else r[0]
-                    uname = r['username'] if isinstance(r, dict) else r[1]
-                    rem = r['remaining'] if isinstance(r, dict) else r[2]
-                    ac = r['active_count'] if isinstance(r, dict) else r[3]
-                    
+                    uid2, uname, rem, ac = r
                     if not uname:
                         uname = fetch_display_username(bot_id, uid2)
                     name = f" ({at_username(uname)})" if uname else ""
@@ -2250,15 +2029,12 @@ def handle_webhook(bot_id: str):
                 
                 total_allowed = 0
                 total_suspended = 0
-                result = execute_query(bot_id,
-                    "SELECT COUNT(*) as count FROM allowed_users",
-                    fetchone=True)
-                total_allowed = result.get('count', 0) if result else 0
-                
-                result = execute_query(bot_id,
-                    "SELECT COUNT(*) as count FROM suspended_users",
-                    fetchone=True)
-                total_suspended = result.get('count', 0) if result else 0
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("SELECT COUNT(*) FROM allowed_users")
+                    total_allowed = c.fetchone()[0]
+                    c.execute("SELECT COUNT(*) FROM suspended_users")
+                    total_suspended = c.fetchone()[0]
                 
                 body = (
                     f"🤖 {config['name']} Status\n"
@@ -2307,7 +2083,10 @@ def handle_webhook(bot_id: str):
                         pass
                     return jsonify({"ok": True})
                 
-                rows = get_all_users_ordered(bot_id)
+                with state["db_lock"]:
+                    c = state["db_conn"].cursor()
+                    c.execute("SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC")
+                    rows = c.fetchall()
                 
                 lines = []
                 for r in rows:
@@ -2597,9 +2376,10 @@ def handle_webhook(bot_id: str):
             # Update username only for existing/allowed users
             try:
                 if check_db_health(bot_id):
-                    execute_query(bot_id,
-                        "UPDATE allowed_users SET username = %s WHERE user_id = %s",
-                        (username or "", uid))
+                    with state["db_lock"]:
+                        c = state["db_conn"].cursor()
+                        c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username or "", uid))
+                        state["db_conn"].commit()
             except Exception:
                 logger.exception("webhook: update allowed_users username failed for %s", bot_id)
 
@@ -2621,15 +2401,14 @@ def handle_webhook(bot_id: str):
                             except Exception:
                                 invalid.append(p)
                                 continue
-                            result = execute_query(bot_id,
-                                "SELECT 1 FROM allowed_users WHERE user_id = %s",
-                                (tid,), fetchone=True)
-                            if result:
-                                already.append(tid)
-                                continue
-                            execute_query(bot_id,
-                                "INSERT INTO allowed_users (user_id, username, added_at) VALUES (%s, %s, %s)",
-                                (tid, "", now_ts()))
+                            with state["db_lock"]:
+                                c = state["db_conn"].cursor()
+                                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (tid,))
+                                if c.fetchone():
+                                    already.append(tid)
+                                    continue
+                                c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", (tid, "", now_ts()))
+                                state["db_conn"].commit()
                             added.append(tid)
                             try:
                                 send_message(bot_id, tid, f"✅ You have been added. Send any text to start.")
