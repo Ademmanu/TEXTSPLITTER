@@ -2046,7 +2046,7 @@ def handle_user_text(bot_id: str, user_id: int, username: str, text: str):
             return jsonify({"ok": True})
         
         send_message(bot_id, user_id, f"⛔ You have been suspended until {until_wat} by {config['owner_tag']}.")
-        return jsonify({"ok": True}")
+        return jsonify({"ok": True})
     
     res = enqueue_task(bot_id, user_id, username, text)
     if not res["ok"]:
@@ -2057,7 +2057,7 @@ def handle_user_text(bot_id: str, user_id: int, username: str, text: str):
             send_message(bot_id, user_id, f"⏳ Your queue is full ({res['queue_size']}). Use /stop or wait.")
             return jsonify({"ok": True})
         send_message(bot_id, user_id, "❗ Could not queue task. Try later.")
-        return jsonify({"ok": True}")
+        return jsonify({"ok": True})
     
     start_user_worker_if_needed(bot_id, user_id)
     notify_user_worker(bot_id, user_id)
@@ -2601,7 +2601,7 @@ def handle_webhook(bot_id: str):
                                 target = int(parts[0])
                             except Exception:
                                 send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             dur = parts[1]
                             reason = parts[2] if len(parts) > 2 else ""
@@ -2609,7 +2609,7 @@ def handle_webhook(bot_id: str):
                             result = parse_duration(dur)
                             if result[0] is None:
                                 send_message(bot_id, uid, f"❌ {result[1]}\n\nValid examples: 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             seconds, formatted_duration = result
                             suspend_user(bot_id, target, seconds, reason)
@@ -2618,14 +2618,14 @@ def handle_webhook(bot_id: str):
                             
                             clear_owner_state(bot_id, uid)
                             send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                            return jsonify({"ok": True}")
+                            return jsonify({"ok": True})
                     
                     elif operation == "unsuspend":
                         try:
                             target = int(text.strip())
                         except Exception:
                             send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
-                            return jsonify({"ok": True}")
+                            return jsonify({"ok": True})
                         
                         ok = unsuspend_user(bot_id, target)
                         if ok:
@@ -2635,7 +2635,7 @@ def handle_webhook(bot_id: str):
                         
                         clear_owner_state(bot_id, uid)
                         send_message(bot_id, uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
-                        return jsonify({"ok": True}")
+                        return jsonify({"ok": True})
                     
                     elif operation == "checkallpreview":
                         if step == 0:
@@ -2645,13 +2645,13 @@ def handle_webhook(bot_id: str):
                                     raise ValueError
                             except Exception:
                                 send_message(bot_id, uid, "❌ Please enter a valid positive number of hours.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             all_users = get_all_users_ordered(bot_id)
                             if not all_users:
                                 clear_owner_state(bot_id, uid)
                                 send_message(bot_id, uid, "📋 No users found.")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             first_user_id, first_username, first_added_at = all_users[0]
                             username_display = at_username(first_username) if first_username else "no username"
@@ -2690,7 +2690,7 @@ def handle_webhook(bot_id: str):
                             
                             clear_owner_state(bot_id, uid)
                             send_message(bot_id, uid, body, {"inline_keyboard": keyboard})
-                            return jsonify({"ok": True}")
+                            return jsonify({"ok": True})
             
             # Handle commands
             if text.startswith("/"):
