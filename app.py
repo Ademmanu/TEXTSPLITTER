@@ -125,15 +125,42 @@ BOT_STATES = {
 NIGERIA_TZ_OFFSET = timedelta(hours=1)
 
 def now_ts() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    """Return current timestamp in format 'Jan 25, 2024 2:30 PM' (no seconds)"""
+    return datetime.utcnow().strftime("%b %d, %Y %-I:%M %p")
 
 def utc_to_wat_ts(utc_ts: str) -> str:
+    """Convert UTC timestamp to WAT in format 'Jan 25, 2024 2:30 PM' (no seconds)"""
     try:
-        utc_dt = datetime.strptime(utc_ts, "%Y-%m-%d %H:%M:%S")
+        # Try to parse the new format first
+        try:
+            utc_dt = datetime.strptime(utc_ts, "%b %d, %Y %-I:%M %p")
+        except ValueError:
+            # Try old format for backward compatibility
+            try:
+                utc_dt = datetime.strptime(utc_ts, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return f"{utc_ts} (parse error)"
+        
         wat_dt = utc_dt + NIGERIA_TZ_OFFSET
-        return wat_dt.strftime("%Y-%m-%d %H:%M:%S WAT")
+        return wat_dt.strftime("%b %d, %Y %-I:%M %p WAT")
     except Exception:
         return f"{utc_ts} (UTC error)"
+
+def parse_timestamp(ts_str: str) -> datetime:
+    """Parse timestamp from string in format 'Jan 25, 2024 2:30 PM'"""
+    try:
+        return datetime.strptime(ts_str, "%b %d, %Y %-I:%M %p")
+    except ValueError:
+        # Try with zero-padded hour for cross-platform compatibility
+        try:
+            return datetime.strptime(ts_str, "%b %d, %Y %I:%M %p")
+        except ValueError:
+            # Try old format for backward compatibility
+            try:
+                return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                # Return current time as fallback
+                return datetime.utcnow()
 
 def at_username(u: str) -> str:
     if not u:
@@ -894,7 +921,8 @@ def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
     if not check_db_health(bot_id):
         return
     
-    until_utc_str = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    until_utc = datetime.utcnow() + timedelta(seconds=seconds)
+    until_utc_str = until_utc.strftime("%b %d, %Y %-I:%M %p")
     until_wat_str = utc_to_wat_ts(until_utc_str)
     try:
         with state["db_lock"]:
@@ -967,7 +995,7 @@ def is_suspended(bot_id: str, user_id: int) -> bool:
         return False
     
     try:
-        until = datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
+        until = parse_timestamp(r[0])
         return until > datetime.utcnow()
     except Exception:
         return False
@@ -1083,7 +1111,8 @@ def stop_user_worker(bot_id: str, user_id: int, join_timeout: float = 2.0):
 def check_stuck_tasks(bot_id: str):
     """Check for stuck tasks for a specific bot"""
     try:
-        cutoff = (datetime.utcnow() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_dt = datetime.utcnow() - timedelta(minutes=2)
+        cutoff_str = cutoff_dt.strftime("%b %d, %Y %-I:%M %p")
         state = BOT_STATES[bot_id]
         
         if not check_db_health(bot_id):
@@ -1091,7 +1120,7 @@ def check_stuck_tasks(bot_id: str):
         
         with state["db_lock"]:
             c = state["db_conn"].cursor()
-            c.execute("SELECT id, user_id, status, retry_count FROM tasks WHERE status = 'running' AND last_activity < ?", (cutoff,))
+            c.execute("SELECT id, user_id, status, retry_count FROM tasks WHERE status = 'running' AND last_activity < ?", (cutoff_str,))
             stuck_tasks = c.fetchall()
             
             for task_id, user_id, status, retry_count in stuck_tasks:
@@ -1397,7 +1426,8 @@ def fetch_display_username(bot_id: str, user_id: int):
     return ""
 
 def compute_last_hour_stats(bot_id: str):
-    cutoff = datetime.utcnow() - timedelta(hours=1)
+    cutoff_dt = datetime.utcnow() - timedelta(hours=1)
+    cutoff_str = cutoff_dt.strftime("%b %d, %Y %-I:%M %p")
     state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return []
@@ -1410,7 +1440,7 @@ def compute_last_hour_stats(bot_id: str):
             WHERE created_at >= ?
             GROUP BY user_id, username
             ORDER BY s DESC
-        """, (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
+        """, (cutoff_str,))
         rows = c.fetchall()
     stat_map = {}
     for uid, uname, s in rows:
@@ -1418,7 +1448,8 @@ def compute_last_hour_stats(bot_id: str):
     return [(k, v["uname"], v["words"]) for k, v in stat_map.items()]
 
 def compute_last_12h_stats(bot_id: str, user_id: int):
-    cutoff = datetime.utcnow() - timedelta(hours=12)
+    cutoff_dt = datetime.utcnow() - timedelta(hours=12)
+    cutoff_str = cutoff_dt.strftime("%b %d, %Y %-I:%M %p")
     state = BOT_STATES[bot_id]
     if not check_db_health(bot_id):
         return 0
@@ -1427,7 +1458,7 @@ def compute_last_12h_stats(bot_id: str, user_id: int):
         c = state["db_conn"].cursor()
         c.execute("""
             SELECT COUNT(*) FROM split_logs WHERE user_id = ? AND created_at >= ?
-        """, (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+        """, (user_id, cutoff_str))
         r = c.fetchone()
         return int(r[0] or 0)
 
@@ -1464,7 +1495,7 @@ def check_and_lift(bot_id: str):
     now = datetime.utcnow()
     for r in rows:
         try:
-            until = datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")
+            until = parse_timestamp(r[1])
             if until <= now:
                 uid = r[0]
                 unsuspend_user(bot_id, uid)
@@ -1473,7 +1504,8 @@ def check_and_lift(bot_id: str):
 
 def prune_old_logs(bot_id: str):
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=SHARED_SETTINGS["log_retention_days"])).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_dt = datetime.utcnow() - timedelta(days=SHARED_SETTINGS["log_retention_days"])
+        cutoff_str = cutoff_dt.strftime("%b %d, %Y %-I:%M %p")
         state = BOT_STATES[bot_id]
         
         if not check_db_health(bot_id):
@@ -1481,9 +1513,9 @@ def prune_old_logs(bot_id: str):
         
         with state["db_lock"]:
             c = state["db_conn"].cursor()
-            c.execute("DELETE FROM split_logs WHERE created_at < ?", (cutoff,))
+            c.execute("DELETE FROM split_logs WHERE created_at < ?", (cutoff_str,))
             deleted1 = c.rowcount
-            c.execute("DELETE FROM sent_messages WHERE sent_at < ?", (cutoff,))
+            c.execute("DELETE FROM sent_messages WHERE sent_at < ?", (cutoff_str,))
             deleted2 = c.rowcount
             state["db_conn"].commit()
         if deleted1 or deleted2:
@@ -1625,7 +1657,8 @@ def is_owner_in_operation(bot_id: str, user_id: int) -> bool:
         return user_id in state["owner_ops_state"]
 
 def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0) -> Tuple[List[Dict], int, int]:
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    cutoff_dt = datetime.utcnow() - timedelta(hours=hours)
+    cutoff_str = cutoff_dt.strftime("%b %d, %Y %-I:%M %p")
     state = BOT_STATES[bot_id]
     
     if not check_db_health(bot_id):
@@ -1638,7 +1671,7 @@ def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0)
             FROM tasks 
             WHERE user_id = ? AND created_at >= ?
             ORDER BY created_at DESC
-        """, (user_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+        """, (user_id, cutoff_str))
         rows = c.fetchall()
     
     tasks = []
@@ -2137,7 +2170,7 @@ def handle_webhook(bot_id: str):
                 # Auto-unsuspend expired ones first
                 for row in list_suspended(bot_id)[:]:
                     uid2, until_utc, reason, added_at_utc = row
-                    until_dt = datetime.strptime(until_utc, "%Y-%m-%d %H:%M:%S")
+                    until_dt = parse_timestamp(until_utc)
                     if until_dt <= datetime.utcnow():
                         unsuspend_user(bot_id, uid2)
                 
@@ -2448,7 +2481,8 @@ def handle_webhook(bot_id: str):
                             seconds, formatted_duration = result
                             suspend_user(bot_id, target, seconds, reason)
                             reason_part = f"\nReason: {reason}" if reason else ""
-                            until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
+                            until_utc = datetime.utcnow() + timedelta(seconds=seconds)
+                            until_wat = utc_to_wat_ts(until_utc.strftime("%b %d, %Y %-I:%M %p"))
                             
                             clear_owner_state(bot_id, uid)
                             send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
