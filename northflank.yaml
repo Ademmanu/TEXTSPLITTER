@@ -11,6 +11,11 @@ services:
       - name: PORT
         value: 8080
       
+      # Database Configuration
+      - name: DATABASE_URL
+        description: "PostgreSQL connection URL (e.g., postgresql://user:pass@host:5432/dbname)"
+        secret: true
+      
       # Bot A Configuration
       - name: TELEGRAM_TOKEN_A
         description: "Telegram Bot Token for Bot A from @BotFather"
@@ -44,14 +49,6 @@ services:
       - name: ALLOWED_USERS_C
         description: "Comma-separated allowed user IDs for Bot C"
       
-      # Database paths for each bot (with /tmp fix applied to all)
-      - name: DB_PATH_A
-        value: "/tmp/botdata_a.sqlite3"
-      - name: DB_PATH_B
-        value: "/tmp/botdata_b.sqlite3"
-      - name: DB_PATH_C
-        value: "/tmp/botdata_c.sqlite3"
-      
       # Bot A & B specific settings (fast intervals - 0.5-0.7s)
       - name: MAX_QUEUE_PER_USER_A
         value: "5"
@@ -84,6 +81,10 @@ services:
         value: "6"
       - name: PERMANENT_SUSPEND_DAYS
         value: "365"
+      - name: DB_POOL_MIN_CONN
+        value: "1"
+      - name: DB_POOL_MAX_CONN
+        value: "20"
     
     resources:
       memory: 512Mi  # Increased for 3 bots
