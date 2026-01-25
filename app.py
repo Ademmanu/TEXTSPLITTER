@@ -124,16 +124,43 @@ BOT_STATES = {
 
 NIGERIA_TZ_OFFSET = timedelta(hours=1)
 
+def format_datetime(dt: datetime) -> str:
+    """Format datetime to 'Jan 25, 2024 2:30 PM' format (cross-platform compatible)"""
+    try:
+        # Try Linux/macOS format first (%-I for hour without leading zero)
+        try:
+            return dt.strftime("%b %d, %Y %-I:%M %p")
+        except ValueError:
+            # Fallback to Windows format (#I for hour without leading zero)
+            return dt.strftime("%b %d, %Y %#I:%M %p")
+    except Exception:
+        # Ultimate fallback
+        return dt.strftime("%b %d, %Y %I:%M %p").replace(" 0", " ").lstrip("0")
+
 def now_ts() -> str:
+    """Current UTC timestamp in ISO format for database storage"""
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+def now_display() -> str:
+    """Current UTC time in display format"""
+    return format_datetime(datetime.utcnow())
+
 def utc_to_wat_ts(utc_ts: str) -> str:
+    """Convert UTC timestamp string to WAT display format"""
     try:
+        # Parse the stored ISO format timestamp
         utc_dt = datetime.strptime(utc_ts, "%Y-%m-%d %H:%M:%S")
         wat_dt = utc_dt + NIGERIA_TZ_OFFSET
-        return wat_dt.strftime("%Y-%m-%d %H:%M:%S WAT")
+        return format_datetime(wat_dt) + " WAT"
     except Exception:
-        return f"{utc_ts} (UTC error)"
+        # If parsing fails, try to handle it gracefully
+        try:
+            # Try parsing with new format
+            utc_dt = datetime.strptime(utc_ts, "%b %d, %Y %I:%M %p")
+            wat_dt = utc_dt + NIGERIA_TZ_OFFSET
+            return format_datetime(wat_dt) + " WAT"
+        except Exception:
+            return f"{utc_ts} (time error)"
 
 def at_username(u: str) -> str:
     if not u:
@@ -895,7 +922,8 @@ def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
         return
     
     until_utc_str = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
-    until_wat_str = utc_to_wat_ts(until_utc_str)
+    until_dt = datetime.utcnow() + timedelta(seconds=seconds)
+    until_wat_str = format_datetime(until_dt + NIGERIA_TZ_OFFSET) + " WAT"
     try:
         with state["db_lock"]:
             c = state["db_conn"].cursor()
@@ -1646,10 +1674,17 @@ def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0)
         task_id, text, created_at, total_words, sent_count = r
         words = split_text_to_words(text)
         preview = " ".join(words[:2]) if len(words) >= 2 else words[0] if words else "(empty)"
+        # Convert ISO timestamp to display format
+        try:
+            created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+            created_display = format_datetime(created_dt + NIGERIA_TZ_OFFSET) + " WAT"
+        except Exception:
+            created_display = utc_to_wat_ts(created_at)
+        
         tasks.append({
             "id": task_id,
             "preview": preview,
-            "created_at": utc_to_wat_ts(created_at),
+            "created_at": created_display,
             "total_words": total_words,
             "sent_count": sent_count
         })
@@ -2448,7 +2483,8 @@ def handle_webhook(bot_id: str):
                             seconds, formatted_duration = result
                             suspend_user(bot_id, target, seconds, reason)
                             reason_part = f"\nReason: {reason}" if reason else ""
-                            until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
+                            until_dt = datetime.utcnow() + timedelta(seconds=seconds)
+                            until_wat = format_datetime(until_dt + NIGERIA_TZ_OFFSET) + " WAT"
                             
                             clear_owner_state(bot_id, uid)
                             send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
@@ -2565,7 +2601,7 @@ def health_a():
     return jsonify({
         "ok": True, 
         "bot": "A", 
-        "ts": now_ts(),
+        "ts": now_display(),
         "db_connected": db_ok,
         "workers": len(BOT_STATES["bot_a"]["user_workers"])
     }), 200
@@ -2576,7 +2612,7 @@ def health_b():
     return jsonify({
         "ok": True, 
         "bot": "B", 
-        "ts": now_ts(),
+        "ts": now_display(),
         "db_connected": db_ok,
         "workers": len(BOT_STATES["bot_b"]["user_workers"])
     }), 200
@@ -2587,7 +2623,7 @@ def health_c():
     return jsonify({
         "ok": True, 
         "bot": "C", 
-        "ts": now_ts(),
+        "ts": now_display(),
         "db_connected": db_ok,
         "workers": len(BOT_STATES["bot_c"]["user_workers"])
     }), 200
