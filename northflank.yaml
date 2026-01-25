@@ -11,9 +11,9 @@ services:
       - name: PORT
         value: 8080
       
-      # Database Configuration
+      # PostgreSQL Configuration
       - name: DATABASE_URL
-        description: "PostgreSQL connection URL (e.g., postgresql://user:pass@host:5432/dbname)"
+        description: "PostgreSQL connection URL (e.g., postgresql://user:pass@host:port/db)"
         secret: true
       
       # Bot A Configuration
@@ -81,16 +81,11 @@ services:
         value: "6"
       - name: PERMANENT_SUSPEND_DAYS
         value: "365"
-      - name: DB_POOL_MIN_CONN
-        value: "1"
-      - name: DB_POOL_MAX_CONN
-        value: "20"
     
     resources:
-      memory: 512Mi  # Increased for 3 bots
-      cpu: 500m      # Increased for 3 bots
+      memory: 512Mi
+      cpu: 500m
     healthCheck:
-      # Multiple health endpoints available, using bot A as main health check
       path: /health/a
       port: 8080
       initialDelay: 10
