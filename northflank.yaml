@@ -11,11 +11,6 @@ services:
       - name: PORT
         value: 8080
       
-      # PostgreSQL Configuration
-      - name: DATABASE_URL
-        description: "PostgreSQL connection URL (e.g., postgresql://user:pass@host:port/db)"
-        secret: true
-      
       # Bot A Configuration
       - name: TELEGRAM_TOKEN_A
         description: "Telegram Bot Token for Bot A from @BotFather"
@@ -48,6 +43,14 @@ services:
         description: "Comma-separated Telegram user IDs for Bot C owners"
       - name: ALLOWED_USERS_C
         description: "Comma-separated allowed user IDs for Bot C"
+      
+      # Database paths for each bot (with /tmp fix applied to all)
+      - name: DB_PATH_A
+        value: "/tmp/botdata_a.sqlite3"
+      - name: DB_PATH_B
+        value: "/tmp/botdata_b.sqlite3"
+      - name: DB_PATH_C
+        value: "/tmp/botdata_c.sqlite3"
       
       # Bot A & B specific settings (fast intervals - 0.5-0.7s)
       - name: MAX_QUEUE_PER_USER_A
@@ -83,9 +86,10 @@ services:
         value: "365"
     
     resources:
-      memory: 512Mi
-      cpu: 500m
+      memory: 512Mi  # Increased for 3 bots
+      cpu: 500m      # Increased for 3 bots
     healthCheck:
+      # Multiple health endpoints available, using bot A as main health check
       path: /health/a
       port: 8080
       initialDelay: 10
