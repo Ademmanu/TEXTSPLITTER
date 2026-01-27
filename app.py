@@ -51,8 +51,8 @@ BOTS_CONFIG = {
         "db_path": os.environ.get("DB_PATH_A", "/tmp/botdata_a.sqlite3"),
         "interval_speed": "fast",
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_A", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", "50")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_A", "25")),
+        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", "30")),
+        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_A", "15")),
     },
     "bot_b": {
         "name": "Bot B",
@@ -64,8 +64,8 @@ BOTS_CONFIG = {
         "db_path": os.environ.get("DB_PATH_B", "/tmp/botdata_b.sqlite3"),
         "interval_speed": "fast",
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_B", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", "50")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_B", "25")),
+        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", "30")),
+        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_B", "15")),
     },
     "bot_c": {
         "name": "Bot C",
@@ -77,8 +77,8 @@ BOTS_CONFIG = {
         "db_path": os.environ.get("DB_PATH_C", "/tmp/botdata_c.sqlite3"),
         "interval_speed": "slow",
         "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_C", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", "50")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_C", "25")),
+        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", "30")),
+        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_C", "15")),
     }
 }
 
