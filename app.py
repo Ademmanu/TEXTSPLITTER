@@ -2983,7 +2983,7 @@ def handle_webhook(bot_id: str):
                 except Exception:
                     pass
                 
-                return jsonify({"ok": True")
+                return jsonify({"ok": True})
             
             # Answer callback query
             try:
