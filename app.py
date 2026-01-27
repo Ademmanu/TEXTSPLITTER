@@ -2030,7 +2030,7 @@ def _handle_owner_input(bot_id: str, owner_id: int, text: str) -> Any:
         if not all_users:
             clear_owner_state(bot_id, owner_id)
             send_message(bot_id, owner_id, "📋 No users found.")
-            return jsonify({"ok": True")
+            return jsonify({"ok": True})
         
         first_user_id, first_username, first_added_at = all_users[0]
         username_display = at_username(first_username) if first_username else "no username"
