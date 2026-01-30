@@ -23,7 +23,42 @@ logger = logging.getLogger("multibot_wordsplitter")
 
 app = Flask(__name__)
 
-# ===================== CONFIGURATION =====================
+# ===================== SHARED CONFIGURATION =====================
+
+# Shared settings for ALL bots
+SHARED_SETTINGS = {
+    # Webhook URLs (can be different per bot)
+    "webhook_url_base": os.environ.get("WEBHOOK_URL_BASE", ""),
+    
+    # User management (same for all bots)
+    "owner_ids_raw": os.environ.get("OWNER_IDS", ""),
+    "allowed_users_raw": os.environ.get("ALLOWED_USERS", ""),
+    "owner_tag": "Owner (@justmemmy)",
+    
+    # Bot behavior settings (shared across all bots)
+    "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER", "5")),
+    "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND", "30")),
+    "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS", "15")),
+    
+    # Database paths (different per bot)
+    "db_path_template": os.environ.get("DB_PATH_TEMPLATE", "/tmp/botdata_{bot_id}.sqlite3"),
+    
+    # Telegram API tokens (different per bot)
+    "token_a": os.environ.get("TELEGRAM_TOKEN_A", ""),
+    "token_b": os.environ.get("TELEGRAM_TOKEN_B", ""),
+    "token_c": os.environ.get("TELEGRAM_TOKEN_C", ""),
+    
+    # Interval speeds (different per bot)
+    "interval_speed_a": os.environ.get("INTERVAL_SPEED_A", "fast"),
+    "interval_speed_b": os.environ.get("INTERVAL_SPEED_B", "fast"),
+    "interval_speed_c": os.environ.get("INTERVAL_SPEED_C", "slow"),
+    
+    # Shared operational settings
+    "requests_timeout": float(os.environ.get("REQUESTS_TIMEOUT", "10")),
+    "log_retention_days": int(os.environ.get("LOG_RETENTION_DAYS", "30")),
+    "failure_notify_threshold": int(os.environ.get("FAILURE_NOTIFY_THRESHOLD", "6")),
+    "permanent_suspend_days": int(os.environ.get("PERMANENT_SUSPEND_DAYS", "365")),
+}
 
 def parse_id_list(raw: str) -> List[int]:
     if not raw:
@@ -39,64 +74,55 @@ def parse_id_list(raw: str) -> List[int]:
             continue
     return ids
 
-# Configuration for all three bots - DEFAULT ALL PATHS TO /tmp/
+# Parse shared user lists
+shared_owner_ids = parse_id_list(SHARED_SETTINGS["owner_ids_raw"])
+shared_allowed_users = parse_id_list(SHARED_SETTINGS["allowed_users_raw"])
+
+# Configuration for all three bots
 BOTS_CONFIG = {
     "bot_a": {
         "name": "Bot A",
-        "token": os.environ.get("TELEGRAM_TOKEN_A", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_A", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_A", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_A", ""),
-        "owner_tag": "Owner (@justmemmy)",
-        "db_path": os.environ.get("DB_PATH_A", "/tmp/botdata_a.sqlite3"),
-        "interval_speed": "fast",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_A", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", "30")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_A", "15")),
+        "token": SHARED_SETTINGS["token_a"],
+        "webhook_url": f"{SHARED_SETTINGS['webhook_url_base'].rstrip('/')}/webhook/a" if SHARED_SETTINGS["webhook_url_base"] else "",
+        "owner_ids": shared_owner_ids,
+        "allowed_users": shared_allowed_users,
+        "owner_tag": SHARED_SETTINGS["owner_tag"],
+        "db_path": SHARED_SETTINGS["db_path_template"].format(bot_id="a"),
+        "interval_speed": SHARED_SETTINGS["interval_speed_a"],
+        "max_queue_per_user": SHARED_SETTINGS["max_queue_per_user"],
+        "max_msg_per_second": SHARED_SETTINGS["max_msg_per_second"],
+        "max_concurrent_workers": SHARED_SETTINGS["max_concurrent_workers"],
+        "telegram_api": f"https://api.telegram.org/bot{SHARED_SETTINGS['token_a']}" if SHARED_SETTINGS['token_a'] else None,
     },
     "bot_b": {
         "name": "Bot B",
-        "token": os.environ.get("TELEGRAM_TOKEN_B", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_B", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_B", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_B", ""),
-        "owner_tag": "Owner (@justmemmy)",
-        "db_path": os.environ.get("DB_PATH_B", "/tmp/botdata_b.sqlite3"),
-        "interval_speed": "fast",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_B", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", "30")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_B", "15")),
+        "token": SHARED_SETTINGS["token_b"],
+        "webhook_url": f"{SHARED_SETTINGS['webhook_url_base'].rstrip('/')}/webhook/b" if SHARED_SETTINGS["webhook_url_base"] else "",
+        "owner_ids": shared_owner_ids,
+        "allowed_users": shared_allowed_users,
+        "owner_tag": SHARED_SETTINGS["owner_tag"],
+        "db_path": SHARED_SETTINGS["db_path_template"].format(bot_id="b"),
+        "interval_speed": SHARED_SETTINGS["interval_speed_b"],
+        "max_queue_per_user": SHARED_SETTINGS["max_queue_per_user"],
+        "max_msg_per_second": SHARED_SETTINGS["max_msg_per_second"],
+        "max_concurrent_workers": SHARED_SETTINGS["max_concurrent_workers"],
+        "telegram_api": f"https://api.telegram.org/bot{SHARED_SETTINGS['token_b']}" if SHARED_SETTINGS['token_b'] else None,
     },
     "bot_c": {
         "name": "Bot C",
-        "token": os.environ.get("TELEGRAM_TOKEN_C", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_C", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_C", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_C", ""),
-        "owner_tag": "Owner (@justmemmy)",
-        "db_path": os.environ.get("DB_PATH_C", "/tmp/botdata_c.sqlite3"),
-        "interval_speed": "slow",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_C", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", "30")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_C", "15")),
+        "token": SHARED_SETTINGS["token_c"],
+        "webhook_url": f"{SHARED_SETTINGS['webhook_url_base'].rstrip('/')}/webhook/c" if SHARED_SETTINGS["webhook_url_base"] else "",
+        "owner_ids": shared_owner_ids,
+        "allowed_users": shared_allowed_users,
+        "owner_tag": SHARED_SETTINGS["owner_tag"],
+        "db_path": SHARED_SETTINGS["db_path_template"].format(bot_id="c"),
+        "interval_speed": SHARED_SETTINGS["interval_speed_c"],
+        "max_queue_per_user": SHARED_SETTINGS["max_queue_per_user"],
+        "max_msg_per_second": SHARED_SETTINGS["max_msg_per_second"],
+        "max_concurrent_workers": SHARED_SETTINGS["max_concurrent_workers"],
+        "telegram_api": f"https://api.telegram.org/bot{SHARED_SETTINGS['token_c']}" if SHARED_SETTINGS['token_c'] else None,
     }
 }
-
-# Shared settings (can be overridden per bot if needed)
-SHARED_SETTINGS = {
-    "requests_timeout": float(os.environ.get("REQUESTS_TIMEOUT", "10")),
-    "log_retention_days": int(os.environ.get("LOG_RETENTION_DAYS", "30")),
-    "failure_notify_threshold": int(os.environ.get("FAILURE_NOTIFY_THRESHOLD", "6")),
-    "permanent_suspend_days": int(os.environ.get("PERMANENT_SUSPEND_DAYS", "365")),
-}
-
-# Initialize bot-specific parsed lists
-for bot_id in BOTS_CONFIG:
-    config = BOTS_CONFIG[bot_id]
-    config["owner_ids"] = parse_id_list(config["owner_ids_raw"])
-    config["allowed_users"] = parse_id_list(config["allowed_users_raw"])
-    config["primary_owner"] = config["owner_ids"][0] if config["owner_ids"] else None
-    config["telegram_api"] = f"https://api.telegram.org/bot{config['token']}" if config['token'] else None
 
 # ===================== GLOBALS =====================
 
@@ -194,7 +220,7 @@ def init_db(bot_id: str):
     config = BOTS_CONFIG[bot_id]
     state = BOT_STATES[bot_id]
     
-    # Get the db_path from config (already defaults to /tmp/)
+    # Get the db_path from config
     db_path = config["db_path"]
     
     # Log the path we're using
@@ -1237,8 +1263,8 @@ def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event,
                     pass
 
             # BOT-SPECIFIC INTERVAL SPEEDS
-            # Bot A & B: fast intervals (0.5-0.7s)
-            # Bot C: slow intervals (1.0-1.2s)
+            # Bot A & B: fast intervals (0.5-0.7s) by default
+            # Bot C: slow intervals (1.0-1.2s) by default
             if config["interval_speed"] == "fast":
                 interval = 0.5 if total <= 150 else (0.6 if total <= 300 else 0.7)
             else:  # "slow" for Bot C
@@ -2649,15 +2675,10 @@ def set_webhook(bot_id: str):
         logger.info("Webhook not configured for %s", bot_id)
         return
     try:
-        # Ensure the webhook URL is correct for this bot
-        webhook_url = config["webhook_url"]
-        if not webhook_url.endswith(f"/webhook/{bot_id.split('_')[-1].lower()}"):
-            webhook_url = f"{webhook_url.rstrip('/')}/webhook/{bot_id.split('_')[-1].lower()}"
-        
         get_session(bot_id).post(f"{config['telegram_api']}/setWebhook", 
-                                json={"url": webhook_url}, 
+                                json={"url": config["webhook_url"]}, 
                                 timeout=SHARED_SETTINGS["requests_timeout"])
-        logger.info("Webhook set for %s to %s", bot_id, webhook_url)
+        logger.info("Webhook set for %s to %s", bot_id, config["webhook_url"])
     except Exception:
         logger.exception("set_webhook failed for %s", bot_id)
 
