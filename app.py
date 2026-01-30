@@ -39,46 +39,50 @@ def parse_id_list(raw: str) -> List[int]:
             continue
     return ids
 
-# Configuration for all three bots - DEFAULT ALL PATHS TO /tmp/
+# Shared configuration for all bots
+SHARED_CONFIG = {
+    # Shared user management
+    "owner_ids_raw": os.environ.get("OWNER_IDS", ""),
+    "allowed_users_raw": os.environ.get("ALLOWED_USERS", ""),
+    "owner_tag": "Owner (@justmemmy)",
+    
+    # Shared performance limits
+    "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER", "5")),
+    "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND", "30")),
+    "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS", "15")),
+    
+    # Shared webhook base URL
+    "webhook_base": os.environ.get("WEBHOOK_URL_BASE", ""),
+    
+    # Default interval speed (can be overridden per bot)
+    "interval_speed": "fast",
+}
+
+# Bot-specific configuration (only token, db_path, and speed are bot-specific)
 BOTS_CONFIG = {
     "bot_a": {
+        **SHARED_CONFIG,
         "name": "Bot A",
         "token": os.environ.get("TELEGRAM_TOKEN_A", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_A", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_A", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_A", ""),
-        "owner_tag": "Owner (@justmemmy)",
         "db_path": os.environ.get("DB_PATH_A", "/tmp/botdata_a.sqlite3"),
         "interval_speed": "fast",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_A", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", "30")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_A", "15")),
+        "webhook_suffix": "a",
     },
     "bot_b": {
+        **SHARED_CONFIG,
         "name": "Bot B",
         "token": os.environ.get("TELEGRAM_TOKEN_B", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_B", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_B", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_B", ""),
-        "owner_tag": "Owner (@justmemmy)",
         "db_path": os.environ.get("DB_PATH_B", "/tmp/botdata_b.sqlite3"),
         "interval_speed": "fast",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_B", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", "30")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_B", "15")),
+        "webhook_suffix": "b",
     },
     "bot_c": {
+        **SHARED_CONFIG,
         "name": "Bot C",
         "token": os.environ.get("TELEGRAM_TOKEN_C", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_C", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_C", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_C", ""),
-        "owner_tag": "Owner (@justmemmy)",
         "db_path": os.environ.get("DB_PATH_C", "/tmp/botdata_c.sqlite3"),
         "interval_speed": "slow",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_C", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", "30")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_C", "15")),
+        "webhook_suffix": "c",
     }
 }
 
@@ -90,12 +94,21 @@ SHARED_SETTINGS = {
     "permanent_suspend_days": int(os.environ.get("PERMANENT_SUSPEND_DAYS", "365")),
 }
 
-# Initialize bot-specific parsed lists
+# Initialize bot-specific parsed lists and webhook URLs
 for bot_id in BOTS_CONFIG:
     config = BOTS_CONFIG[bot_id]
+    
+    # Parse shared ID lists
     config["owner_ids"] = parse_id_list(config["owner_ids_raw"])
     config["allowed_users"] = parse_id_list(config["allowed_users_raw"])
     config["primary_owner"] = config["owner_ids"][0] if config["owner_ids"] else None
+    
+    # Build webhook URL from base + suffix
+    base = config["webhook_base"].rstrip("/")
+    suffix = config["webhook_suffix"]
+    config["webhook_url"] = f"{base}/webhook/{suffix}"
+    
+    # Telegram API URL
     config["telegram_api"] = f"https://api.telegram.org/bot{config['token']}" if config['token'] else None
 
 # ===================== GLOBALS =====================
@@ -936,13 +949,13 @@ def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
     stopped = cancel_active_task_for_user(bot_id, target_id)
     try:
         reason_text = f"\nReason: {reason}" if reason else ""
-        send_message(bot_id, target_id, f"⛔ You have been suspended until {until_wat_str} by {config['owner_tag']}.{reason_text}")
+        send_message(bot_id, target_id, f"⛔ You have been suspended until {until_wat_str} by {config['owner_tag']}.{reason_text}\n\nTo avoid future suspensions, please follow Owner's instructions.")
     except Exception:
         logger.exception("notify suspended user failed for %s", bot_id)
     
     notify_owners(bot_id, f"🔒 User suspended: {label_for_owner_view(bot_id, target_id, fetch_display_username(bot_id, target_id))} suspended_until={until_wat_str} by {config['owner_tag']} reason={reason}")
 
-def unsuspend_user(bot_id: str, target_id: int) -> bool:
+def unsuspend_user(bot_id: str, target_id: int, is_auto: bool = False) -> bool:
     config = BOTS_CONFIG[bot_id]
     state = BOT_STATES[bot_id]
     
@@ -958,12 +971,34 @@ def unsuspend_user(bot_id: str, target_id: int) -> bool:
         c.execute("DELETE FROM suspended_users WHERE user_id = ?", (target_id,))
         state["db_conn"].commit()
     
-    try:
-        send_message(bot_id, target_id, f"✅ You have been unsuspended by {config['owner_tag']}.")
-    except Exception:
-        logger.exception("notify unsuspended failed for %s", bot_id)
+    # Extract owner name without tag for friendly messages
+    owner_name = "Owner"  # Simple name without @username
     
-    notify_owners(bot_id, f"🔓 Manual unsuspend: {label_for_owner_view(bot_id, target_id, fetch_display_username(bot_id, target_id))} by {config['owner_tag']}.")
+    if is_auto:
+        # Auto unsuspension (due to time expiry)
+        try:
+            send_message(bot_id, target_id, 
+                f"✅ Your suspension has expired and you have been automatically unsuspended.\n\n"
+                f"To avoid future suspensions, please follow {owner_name}'s instructions."
+            )
+        except Exception:
+            logger.exception("notify auto unsuspended failed for %s", bot_id)
+        
+        # Don't notify owners for auto unsuspensions
+    else:
+        # Manual unsuspension
+        try:
+            send_message(bot_id, target_id, 
+                f"✅ You have been manually unsuspended by {config['owner_tag']}.\n\n"
+                f"To avoid future suspensions, please follow {owner_name}'s instructions."
+            )
+        except Exception:
+            logger.exception("notify manual unsuspended failed for %s", bot_id)
+        
+        notify_owners(bot_id, 
+            f"🔓 Manual unsuspend: {label_for_owner_view(bot_id, target_id, fetch_display_username(bot_id, target_id))} by {config['owner_tag']}."
+        )
+    
     return True
 
 def list_suspended(bot_id: str):
@@ -1495,7 +1530,7 @@ def check_and_lift(bot_id: str):
             until = datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")
             if until <= now:
                 uid = r[0]
-                unsuspend_user(bot_id, uid)
+                unsuspend_user(bot_id, uid, is_auto=True)  # Mark as auto unsuspension
         except Exception:
             logger.exception("suspend parse error for %s in %s", r, bot_id)
 
@@ -2174,7 +2209,7 @@ def handle_webhook(bot_id: str):
                     uid2, until_utc, reason, added_at_utc = row
                     until_dt = datetime.strptime(until_utc, "%Y-%m-%d %H:%M:%S")
                     if until_dt <= datetime.utcnow():
-                        unsuspend_user(bot_id, uid2)
+                        unsuspend_user(bot_id, uid2, is_auto=True)
                 
                 rows = list_suspended(bot_id)
                 if not rows:
@@ -2497,7 +2532,7 @@ def handle_webhook(bot_id: str):
                             send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
                             return jsonify({"ok": True})
                         
-                        ok = unsuspend_user(bot_id, target)
+                        ok = unsuspend_user(bot_id, target, is_auto=False)  # Manual unsuspension
                         if ok:
                             result = f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} unsuspended."
                         else:
@@ -2651,8 +2686,8 @@ def set_webhook(bot_id: str):
     try:
         # Ensure the webhook URL is correct for this bot
         webhook_url = config["webhook_url"]
-        if not webhook_url.endswith(f"/webhook/{bot_id.split('_')[-1].lower()}"):
-            webhook_url = f"{webhook_url.rstrip('/')}/webhook/{bot_id.split('_')[-1].lower()}"
+        if not webhook_url.endswith(f"/webhook/{config['webhook_suffix']}"):
+            webhook_url = f"{config['webhook_base'].rstrip('/')}/webhook/{config['webhook_suffix']}"
         
         get_session(bot_id).post(f"{config['telegram_api']}/setWebhook", 
                                 json={"url": webhook_url}, 
